@@ -1,0 +1,955 @@
+<!--
+  Powder Dash
+  ===========
+  Single-file snowpack dashboard for NRCS SNOTEL sites. This is the third
+  dashboard in the suite (after Wave Dash and [second dash]) and follows the
+  same single-file, self-contained pattern: a map + parameters panel on top,
+  with data/plot panels to follow below once live SNOTEL data fetching is
+  wired up.
+
+  Scope of this pass: map frame + parameters frame only, pre-populated with
+  SNOTEL sites within ~100 miles of Powder Mountain (site 1300, Cache County,
+  UT — 41.37428, -111.76673). Site coordinates were compiled from the NRCS
+  AWDB REST API (wcc.sc.egov.usda.gov/awdbRestApi) on 2026-09-22, filtered to
+  UT/ID/WY counties plausibly within range and then trimmed by great-circle
+  distance. It's a first pass, not an exhaustive canvas of every county
+  border — worth spot-checking if a site you expect is missing.
+
+  Not yet implemented (next passes):
+    - Storm/new-snow detection logic against the New Snow / Storm SWE
+      threshold fields — right now those are just inputs, not read by
+      anything. The data itself is live as of v0.2.0.
+
+  Versioning: MAJOR.MINOR.PATCH, same convention as Wave Dash. Bumped only at
+  explicit "ready to push" points.
+    v0.3.1 (2026-09-22) — Readability pass: primary-site lines are now drawn
+      thicker (width 2.5 vs. 1.3 for comp overlays) so they stand out against
+      comparison sites, and use the same SWE blue everywhere a panel plots a
+      single quantity (Snow Depth, Precip, Wind Direction, Battery), keeping
+      distinct colors only where a panel legitimately shows more than one
+      quantity (Air Temp obs/max/min/avg, Humidity, Wind Speed/Gust,
+      Radiation in/out, and the multi-depth soil/snowpack-profile panels).
+      Also fixed the legend on narrow screens: it now sits below the plot
+      instead of above it and the panel grows to fit however many rows it
+      wraps to, so it no longer covers the top of the chart.
+    v0.3.0 (2026-09-22) — Comparison sites + "new snow" panels: a Comps field
+      (comma-separated site IDs, default 332/634/333/766/814) fetches WTEQ/
+      SNWD/PREC/TOBS for each and overlays them as lighter, hover-labeled
+      lines on the matching panels. Added two derived panels — Change in
+      Snow Depth and Change in SWE, net change from the first hourly reading
+      in the analysis window — rendered first, ahead of the raw panels, with
+      primary + comp delta lines on each. Verified against live AWDB data
+      for 1300 + the default Comps list: all 5 comps resolve and fetch,
+      panel order and trace colors/hover labels are correct. (Current
+      window is snow-free in the Wasatch, so both delta panels are flat at
+      0 right now — confirmed against raw SNWD/WTEQ values, not a bug.)
+    v0.2.0 (2026-09-22) — Live data: "Load Site" now fetches every HOURLY
+      element the NRCS AWDB REST API has for the selected site directly from
+      the browser (confirmed via a real cross-origin fetch test — the AWDB
+      API allows it, unlike NOAA/NDBC, so no Cloudflare Worker proxy is
+      needed here) and renders one stacked line-plot panel per element group
+      for the Analysis End Date / Days to Analyze window. Multi-depth
+      elements (SMS, STO, RDC, SAL, PTEMP) get one panel with a line per
+      depth. Panels are generated dynamically from whatever the site
+      actually reports, so a standard 4-sensor site and a fully "enhanced"
+      site like 1300 both work without per-site config.
+    v0.1.0 (2026-09-22) — Initial map + parameters frame. Leaflet map seeded
+      with 66 SNOTEL sites within 100mi of Powder Mountain (1300); primary
+      site selector, radius control, and placeholder analysis parameters
+      (date range, new-snow/storm SWE thresholds). No live data yet.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Powder Dash</title>
+
+  <!-- Leaflet CSS & JS for Interactive Map -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    if (typeof L === 'undefined') {
+      document.write('<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">');
+      document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"><\/script>');
+    }
+  </script>
+
+  <!-- Plotly.js — not used yet in this pass, but included now (same as Wave
+       Dash) since the snowpack trend / storm-timeline panels planned next
+       will need it, and it's one less thing to wire up later. -->
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <script>
+    if (typeof Plotly === 'undefined') {
+      document.write('<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.27.0/plotly.min.js"><\/script>');
+    }
+  </script>
+
+  <style>
+    /* Layout mechanics below are intentionally identical to Wave Dash's —
+       same grid, panel, and control-group structure — so the dashboard
+       suite reads as one system. Only the accent (icy blue) and map basemap
+       differ, to fit a snowpack/mountain subject instead of a coastal one. */
+    html, body {
+      height: 100%;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 10px;
+      background: #f4f6f8;
+      box-sizing: border-box;
+    }
+    h2 {
+      margin-top: 0;
+      color: #1a252f;
+      font-size: 1.3rem;
+      text-align: center;
+    }
+    .version-badge {
+      font-size: 0.5em;
+      font-weight: normal;
+      color: #8a97a3;
+      vertical-align: middle;
+      margin-left: 6px;
+    }
+
+    .grid-container {
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+      padding-bottom: 20px;
+    }
+    .panel {
+      background: white;
+      padding: 12px;
+      border-radius: 8px;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+
+    .map-controls-row {
+      display: flex;
+      flex-direction: row;
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .map-col {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .controls-col {
+      flex: 1.2;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-width: 0;
+    }
+
+    .params-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px 10px;
+    }
+
+    .span-full {
+      grid-column: span 2;
+    }
+
+    #map {
+      height: 100%;
+      min-height: 320px;
+      width: 100%;
+      border-radius: 6px;
+    }
+
+    .control-group {
+      margin-bottom: 2px;
+    }
+    .control-group label {
+      display: block;
+      font-size: 10px;
+      font-weight: bold;
+      margin-bottom: 2px;
+      white-space: nowrap;
+    }
+    .control-group input, .control-group select {
+      width: 100%;
+      padding: 4px 6px;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 11px;
+    }
+    .control-group input[readonly] {
+      background: #f4f6f8;
+      color: #495057;
+    }
+
+    .btn {
+      background: #2f80ed;
+      color: white;
+      border: none;
+      padding: 8px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 6px;
+      font-weight: bold;
+      font-size: 12px;
+    }
+    .btn:hover { background: #1c64c4; }
+    .status-msg { font-size: 10px; color: #6c757d; margin-top: 4px; font-style: italic; text-align: center; }
+
+    .section-note {
+      font-size: 10px;
+      color: #8a97a3;
+      font-style: italic;
+      margin-top: 4px;
+      text-align: center;
+    }
+
+    /* Data panels — same panel styling, added for the live-data section
+       (renderDataPanels()) below the map+parameters panel. */
+    .panel-title {
+      font-size: 12px;
+      font-weight: bold;
+      color: #1a252f;
+      margin-bottom: 4px;
+    }
+    .panel-note {
+      font-size: 10px;
+      color: #8a97a3;
+      font-style: italic;
+      margin-bottom: 6px;
+    }
+    .plot-box {
+      height: 220px;
+      width: 100%;
+    }
+    .plot-box.tall { height: 320px; }
+
+    @media (min-width: 768px) {
+      body { padding: 15px; }
+      h2 { font-size: 1.5rem; text-align: left; }
+      #map { min-height: 420px; }
+    }
+
+    @media (max-width: 767px) {
+      .map-controls-row { flex-direction: column; }
+      #map { min-height: 280px; }
+    }
+  </style>
+</head>
+<body>
+
+  <h2>❄️ Powder Dash <span id="appVersionLabel" class="version-badge"></span></h2>
+
+  <div class="grid-container">
+    <div class="panel">
+      <div class="map-controls-row">
+
+        <div class="map-col">
+          <label style="font-size: 12px; font-weight: bold; margin-bottom: 4px;">Select SNOTEL Site:</label>
+          <div id="map"></div>
+        </div>
+
+        <div class="controls-col">
+          <div class="params-grid">
+
+            <div class="control-group">
+              <label>Primary Site ID:</label>
+              <input type="text" id="siteId" value="1300">
+            </div>
+
+            <div class="control-group">
+              <label>Search Radius (mi):</label>
+              <input type="number" id="searchRadius" value="100" min="5" max="300">
+            </div>
+
+            <div class="control-group span-full">
+              <label>Site Name:</label>
+              <input type="text" id="siteName" readonly value="Powder Mountain">
+            </div>
+
+            <div class="control-group span-full">
+              <label>Comps (comma-separated site IDs):</label>
+              <input type="text" id="compSites" value="332,634,333,766,814">
+            </div>
+
+            <div class="control-group">
+              <label>Analysis End Date:</label>
+              <input type="date" id="endDate">
+            </div>
+
+            <div class="control-group">
+              <label>Days to Analyze:</label>
+              <input type="number" id="daysToAnalyze" value="14" min="1" max="90">
+            </div>
+
+            <div class="control-group">
+              <label>New Snow Thresh (in):</label>
+              <input type="number" step="0.5" id="newSnowThreshold" value="6" min="0">
+            </div>
+
+            <div class="control-group">
+              <label>Storm SWE Thresh (in):</label>
+              <input type="number" step="0.1" id="stormSweThreshold" value="0.5" min="0">
+            </div>
+
+          </div>
+
+          <button class="btn" id="loadBtn" onclick="loadSite()">Load Site</button>
+          <div id="statusMsg" class="status-msg">Ready.</div>
+          <div class="section-note">New Snow / Storm SWE thresholds aren't wired to any detection logic yet — data below is live, that analysis isn't.</div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <div class="grid-container">
+    <div class="panel">
+      <div class="panel-title">Recent Conditions</div>
+      <div id="dataStatusMsg" class="status-msg" style="text-align: left; margin-top: 0;">Ready.</div>
+    </div>
+  </div>
+
+  <div class="grid-container" id="dataPanels"></div>
+
+  <script>
+    /* =====================================================================
+       CONFIGURATION & CONSTANTS
+       ===================================================================== */
+    const APP_VERSION = "0.3.1";
+    document.getElementById('appVersionLabel').innerText = `v${APP_VERSION}`;
+
+    const EARTH_RADIUS_MILES = 3958.8;
+    const MILES_TO_METERS = 1609.34;
+    const DEFAULT_SITE_ID = "1300";
+    const DEFAULT_RADIUS_MILES = 100;
+
+    const plotlyConfig = {
+      displayModeBar: false,
+      scrollZoom: false,
+      responsive: true
+    };
+
+    /* =====================================================================
+       SNOTEL SITE DATA
+       Compiled from the NRCS AWDB REST API (wcc.sc.egov.usda.gov/awdbRestApi)
+       on 2026-09-22: every active SNTL site in UT/ID/WY counties plausibly
+       within range of Powder Mountain (1300), trimmed to those within 100mi
+       by great-circle distance. lat/lon/elevFt are from that API; distances
+       shown in popups are computed live from whichever site is primary.
+       ===================================================================== */
+    const SNOTEL_SITES = [
+      { id: "1300", name: "Powder Mountain",     lat: 41.37428, lon: -111.76673, elevFt: 8490,  county: "Cache",     state: "UT" },
+      { id: "582",  name: "Little Bear",          lat: 41.40562, lon: -111.82607, elevFt: 6540,  county: "Cache",     state: "UT" },
+      { id: "333",  name: "Ben Lomond Trail",     lat: 41.38291, lon: -111.92103, elevFt: 5970,  county: "Weber",     state: "UT" },
+      { id: "332",  name: "Ben Lomond Peak",      lat: 41.37603, lon: -111.94405, elevFt: 7690,  county: "Weber",     state: "UT" },
+      { id: "455",  name: "Dry Bread Pond",       lat: 41.41289, lon: -111.53770, elevFt: 8290,  county: "Cache",     state: "UT" },
+      { id: "1056", name: "Lightning Ridge",      lat: 41.35891, lon: -111.48749, elevFt: 8200,  county: "Weber",     state: "UT" },
+      { id: "634",  name: "Monte Cristo",         lat: 41.46547, lon: -111.49688, elevFt: 8930,  county: "Cache",     state: "UT" },
+      { id: "533",  name: "Horse Ridge",          lat: 41.31372, lon: -111.44624, elevFt: 8210,  county: "Morgan",    state: "UT" },
+      { id: "1145", name: "Kilfoil Creek",        lat: 41.24764, lon: -111.41249, elevFt: 7230,  county: "Morgan",    state: "UT" },
+      { id: "1118", name: "Lost Creek Resv",      lat: 41.22155, lon: -111.35947, elevFt: 6070,  county: "Morgan",    state: "UT" },
+      { id: "1054", name: "Farmington Lower",     lat: 40.99200, lon: -111.81702, elevFt: 6850,  county: "Davis",     state: "UT" },
+      { id: "474",  name: "Farmington",           lat: 40.97462, lon: -111.80975, elevFt: 7920,  county: "Davis",     state: "UT" },
+      { id: "374",  name: "Bug Lake",             lat: 41.68541, lon: -111.41987, elevFt: 7980,  county: "Rich",      state: "UT" },
+      { id: "971",  name: "Parrish Creek",        lat: 40.93417, lon: -111.81372, elevFt: 7760,  county: "Davis",     state: "UT" },
+      { id: "1013", name: "Temple Fork",          lat: 41.79300, lon: -111.54605, elevFt: 7420,  county: "Cache",     state: "UT" },
+      { id: "896",  name: "Hardscrabble",         lat: 40.86833, lon: -111.71865, elevFt: 7270,  county: "Morgan",    state: "UT" },
+      { id: "1098", name: "Usu Doc Daniel",       lat: 41.86425, lon: -111.50603, elevFt: 8610,  county: "Rich",      state: "UT" },
+      { id: "1113", name: "Tony Grove RS",        lat: 41.88573, lon: -111.56918, elevFt: 6320,  county: "Cache",     state: "UT" },
+      { id: "823",  name: "Tony Grove Lake",      lat: 41.89833, lon: -111.62957, elevFt: 8450,  county: "Cache",     state: "UT" },
+      { id: "596",  name: "Lookout Peak",         lat: 40.83731, lon: -111.70965, elevFt: 8150,  county: "Salt Lake", state: "UT" },
+      { id: "972",  name: "Louis Meadow",         lat: 40.83033, lon: -111.76457, elevFt: 6740,  county: "Salt Lake", state: "UT" },
+      { id: "1114", name: "Garden City Summit",   lat: 41.92150, lon: -111.46930, elevFt: 7680,  county: "Cache",     state: "UT" },
+      { id: "1115", name: "Klondike Narrows",     lat: 41.96769, lon: -111.59713, elevFt: 7280,  county: "Cache",     state: "UT" },
+      { id: "684",  name: "Parleys Summit",       lat: 40.76184, lon: -111.62917, elevFt: 7590,  county: "Summit",    state: "UT" },
+      { id: "1321", name: "Mill Creek Canyon",    lat: 40.69656, lon: -111.67712, elevFt: 6960,  county: "Salt Lake", state: "UT" },
+      { id: "856",  name: "Parleys Upper",        lat: 40.70194, lon: -111.60619, elevFt: 8330,  county: "Salt Lake", state: "UT" },
+      { id: "1348", name: "Clarkston Mountain",   lat: 41.99513, lon: -112.16119, elevFt: 6690,  county: "Cache",     state: "UT" },
+      { id: "484",  name: "Franklin Basin",       lat: 42.05050, lon: -111.60120, elevFt: 8140,  county: "Franklin",  state: "ID" },
+      { id: "393",  name: "Chalk Creek #2",       lat: 40.88529, lon: -111.06954, elevFt: 8200,  county: "Summit",    state: "UT" },
+      { id: "628",  name: "Mill-D North",         lat: 40.65883, lon: -111.63683, elevFt: 8940,  county: "Salt Lake", state: "UT" },
+      { id: "392",  name: "Chalk Creek #1",       lat: 40.85464, lon: -111.04765, elevFt: 9160,  county: "Summit",    state: "UT" },
+      { id: "814",  name: "Thaynes Canyon",       lat: 40.62350, lon: -111.53322, elevFt: 9260,  county: "Summit",    state: "UT" },
+      { id: "763",  name: "Smith Morehouse",      lat: 40.78931, lon: -111.09192, elevFt: 7640,  county: "Summit",    state: "UT" },
+      { id: "366",  name: "Brighton",             lat: 40.59936, lon: -111.58167, elevFt: 8790,  county: "Salt Lake", state: "UT" },
+      { id: "1308", name: "Atwater",              lat: 40.59124, lon: -111.63775, elevFt: 8750,  county: "Salt Lake", state: "UT" },
+      { id: "1135", name: "Burts Miller Ranch",   lat: 40.98492, lon: -110.85075, elevFt: 7900,  county: "Summit",    state: "UT" },
+      { id: "766",  name: "Snowbird",             lat: 40.56914, lon: -111.65852, elevFt: 9170,  county: "Salt Lake", state: "UT" },
+      { id: "1225", name: "Redden Mine Lwr",      lat: 40.67505, lon: -111.21765, elevFt: 8540,  county: "Summit",    state: "UT" },
+      { id: "906",  name: "Dry Fork",             lat: 40.56533, lon: -112.17343, elevFt: 7180,  county: "Salt Lake", state: "UT" },
+      { id: "517",  name: "Hayden Fork",          lat: 40.79669, lon: -110.88472, elevFt: 9170,  county: "Summit",    state: "UT" },
+      { id: "579",  name: "Lily Lake",            lat: 40.86493, lon: -110.79813, elevFt: 9130,  county: "Summit",    state: "UT" },
+      { id: "828",  name: "Trial Lake",           lat: 40.67800, lon: -110.94873, elevFt: 9970,  county: "Summit",    state: "UT" },
+      { id: "1214", name: "Bevans Cabin",         lat: 40.46182, lon: -112.25233, elevFt: 6470,  county: "Tooele",    state: "UT" },
+      { id: "1162", name: "Blacks Fork Jct",      lat: 40.95814, lon: -110.58280, elevFt: 8880,  county: "Summit",    state: "UT" },
+      { id: "1192", name: "Buck Pasture",         lat: 40.84456, lon: -110.66068, elevFt: 9630,  county: "Summit",    state: "UT" },
+      { id: "723",  name: "Rocky Basin-Settleme", lat: 40.44293, lon: -112.22377, elevFt: 8700,  county: "Tooele",    state: "UT" },
+      { id: "471",  name: "Emigrant Summit",      lat: 42.36055, lon: -111.56085, elevFt: 7390,  county: "Bear Lake", state: "ID" },
+      { id: "1163", name: "EF Blacks Fork GS",    lat: 40.88472, lon: -110.54056, elevFt: 9360,  county: "Summit",    state: "UT" },
+      { id: "1164", name: "Wolf Creek Peak",      lat: 40.47733, lon: -111.04469, elevFt: 9770,  county: "Wasatch",   state: "UT" },
+      { id: "521",  name: "Hewinta",              lat: 40.95009, lon: -110.48419, elevFt: 9510,  county: "Summit",    state: "UT" },
+      { id: "790",  name: "Steel Creek Park",     lat: 40.90862, lon: -110.50462, elevFt: 10140, county: "Summit",    state: "UT" },
+      { id: "631",  name: "Mining Fork",          lat: 40.49384, lon: -112.61141, elevFt: 8290,  county: "Tooele",    state: "UT" },
+      { id: "509",  name: "Hams Fork",            lat: 42.14600, lon: -110.67833, elevFt: 7860,  county: "Lincoln",   state: "WY" },
+      { id: "493",  name: "Giveout",              lat: 42.41320, lon: -111.16630, elevFt: 6940,  county: "Bear Lake", state: "ID" },
+      { id: "432",  name: "Currant Creek",        lat: 40.35747, lon: -111.08993, elevFt: 7920,  county: "Wasatch",   state: "UT" },
+      { id: "554",  name: "Kelley R.S.",          lat: 42.26554, lon: -110.80181, elevFt: 8240,  county: "Lincoln",   state: "WY" },
+      { id: "435",  name: "Daniels-Strawberry",   lat: 40.29530, lon: -111.25677, elevFt: 8010,  county: "Wasatch",   state: "UT" },
+      { id: "741",  name: "Sedgwick Peak",        lat: 42.52463, lon: -111.95632, elevFt: 7800,  county: "Bannock",   state: "ID" },
+      { id: "544",  name: "Indian Creek",         lat: 42.30023, lon: -110.67753, elevFt: 9400,  county: "Lincoln",   state: "WY" },
+      { id: "761",  name: "Slug Creek Divide",    lat: 42.56248, lon: -111.29797, elevFt: 7240,  county: "Caribou",   state: "ID" },
+      { id: "528",  name: "Hole-in-Rock",         lat: 40.92167, lon: -110.18623, elevFt: 9170,  county: "Summit",    state: "UT" },
+      { id: "795",  name: "Strawberry Divide",    lat: 40.16483, lon: -111.20665, elevFt: 8100,  county: "Wasatch",   state: "UT" },
+      { id: "730",  name: "Salt River Summit",    lat: 42.50750, lon: -110.90990, elevFt: 7630,  county: "Lincoln",   state: "WY" },
+      { id: "1151", name: "George Creek",         lat: 41.91562, lon: -113.41154, elevFt: 8960,  county: "Box Elder", state: "UT" },
+      { id: "1299", name: "Pebble Creek",         lat: 42.76740, lon: -112.10648, elevFt: 6520,  county: "Caribou",   state: "ID" },
+      { id: "677",  name: "Oxford Spring",        lat: 42.26024, lon: -112.12523, elevFt: 6790,  county: "Oneida",    state: "ID" }
+    ];
+
+    /* =====================================================================
+       DATE HELPERS
+       ===================================================================== */
+    function setDefaultEndDate() {
+      const now = new Date();
+      const y = now.getFullYear();
+      const m = String(now.getMonth() + 1).padStart(2, '0');
+      const d = String(now.getDate()).padStart(2, '0');
+      document.getElementById('endDate').value = `${y}-${m}-${d}`;
+    }
+
+    /* =====================================================================
+       MAP INITIALIZATION & RENDER
+       ===================================================================== */
+    let map = null;
+    let mapMarkersGroup = null;
+
+    if (typeof L === 'undefined') {
+      document.getElementById('map').innerHTML =
+        '<div style="display:flex;align-items:center;justify-content:center;height:100%;padding:10px;text-align:center;color:#d9534f;font-size:12px;">Map library failed to load.</div>';
+      document.getElementById('statusMsg').innerText = 'Map library failed to load.';
+    } else {
+      const defaultSite = SNOTEL_SITES.find(s => s.id === DEFAULT_SITE_ID);
+      map = L.map('map').setView([defaultSite.lat, defaultSite.lon], 8);
+
+      // Esri topo basemap — same tile provider family as Wave Dash (which uses
+      // Esri's Ocean layers), swapped for a terrain-appropriate service here.
+      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
+        attribution: 'Tiles &copy; Esri',
+        maxZoom: 15
+      }).addTo(map);
+
+      mapMarkersGroup = L.layerGroup().addTo(map);
+    }
+
+    function getDistanceMiles(lat1, lon1, lat2, lon2) {
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return EARTH_RADIUS_MILES * c;
+    }
+
+    function renderSitesOnMap(targetSite, radiusMiles) {
+      if (!map || !mapMarkersGroup) return;
+      mapMarkersGroup.clearLayers();
+
+      L.circle([targetSite.lat, targetSite.lon], {
+        radius: radiusMiles * MILES_TO_METERS,
+        color: '#2f80ed',
+        fillColor: '#2f80ed',
+        fillOpacity: 0.08,
+        weight: 1.5,
+        interactive: false
+      }).addTo(mapMarkersGroup);
+
+      const nearbySites = SNOTEL_SITES
+        .map(s => ({ ...s, dist: getDistanceMiles(targetSite.lat, targetSite.lon, s.lat, s.lon) }))
+        .filter(s => s.dist <= radiusMiles)
+        .sort((a, b) => a.dist - b.dist);
+
+      nearbySites.forEach(s => {
+        const isTarget = (s.id === targetSite.id);
+
+        const marker = L.circleMarker([s.lat, s.lon], {
+          radius: isTarget ? 8 : 6,
+          color: isTarget ? '#d9534f' : '#007bff',
+          fillColor: isTarget ? '#ff4d4d' : '#3399ff',
+          fillOpacity: 0.9,
+          weight: 2,
+          interactive: true
+        }).addTo(mapMarkersGroup);
+
+        marker.bindTooltip(`${s.name} (${s.id})`, { permanent: false, direction: 'top', offset: [0, -8] });
+        marker.bindPopup(`<b>${s.name}</b> (${s.id})<br>${s.county} County, ${s.state}<br>Elevation: ${s.elevFt.toLocaleString()} ft<br>Distance: ${s.dist.toFixed(1)} miles<br><br>
+          <button onclick="setPrimarySite('${s.id}')" style="padding:4px 8px;font-size:10px;cursor:pointer;">Set as Primary Site</button>
+        `);
+      });
+
+      map.setView([targetSite.lat, targetSite.lon], map.getZoom());
+      return nearbySites.length;
+    }
+
+    function setPrimarySite(id) {
+      document.getElementById('siteId').value = id;
+      loadSite();
+    }
+
+    /* =====================================================================
+       SITE SELECTION
+       ===================================================================== */
+    function loadSite() {
+      const status = document.getElementById('statusMsg');
+      const siteId = document.getElementById('siteId').value.trim();
+      const radiusMiles = parseFloat(document.getElementById('searchRadius').value) || DEFAULT_RADIUS_MILES;
+
+      const site = SNOTEL_SITES.find(s => s.id === siteId);
+      if (!site) {
+        status.innerText = `Site ${siteId} isn't in the local dataset (only sites near Powder Mountain are preloaded) — try one from the map.`;
+        return;
+      }
+
+      document.getElementById('siteName').value = site.name;
+      const count = renderSitesOnMap(site, radiusMiles);
+      status.innerText = `Loaded ${site.name} (${site.id}) — ${count} SNOTEL site${count === 1 ? '' : 's'} within ${radiusMiles} mi.`;
+
+      loadSnowpackData(site);
+    }
+
+    /* =====================================================================
+       LIVE SNOTEL DATA (NRCS AWDB REST API)
+       Fetched directly from the browser — confirmed by a real cross-origin
+       fetch test that the AWDB API allows it (unlike NOAA/NDBC, which is why
+       Wave Dash needs a Cloudflare Worker proxy and this doesn't). Panels
+       are generated dynamically from whatever HOURLY elements the selected
+       site actually reports, grouped per PANEL_GROUPS below, so this works
+       the same for a plain 4-sensor site and a fully "enhanced" site like
+       1300 without per-site configuration.
+       ===================================================================== */
+    const AWDB_DATA_URL = 'https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data';
+
+    const DEPTH_PALETTE = ['#2f80ed', '#d9534f', '#28a745', '#f0a500', '#8e44ad', '#17a2b8'];
+
+    // The one color for every primary-site line that plots a single
+    // quantity (SWE, Snow Depth, Precip, Wind Direction, Battery, the two
+    // delta panels), so the primary site reads consistently across panels.
+    // Panels with more than one genuinely distinct series (Air Temp,
+    // Humidity, Wind Speed/Gust, Radiation) keep their own distinguishing
+    // colors instead — see PANEL_GROUPS below.
+    const PRIMARY_BLUE = '#2f80ed';
+    // Primary-site lines are drawn noticeably thicker than comp overlays so
+    // "the site I'm actually looking at" always stands out from comparison
+    // sites, even with 5 comps on the same panel.
+    const PRIMARY_LINE_WIDTH = 2.5;
+
+    // Fixed color per comp site (by position in the Comps list, cycling past
+    // 6), used everywhere that site appears so it reads as "the same site"
+    // across every panel rather than getting re-colored per chart. Lighter/
+    // desaturated on purpose so comp lines visually recede behind the
+    // primary site's bolder line.
+    const COMP_PALETTE = ['#8ab6e8', '#e8a3a3', '#93d0a6', '#e8c97a', '#b79ae0', '#7fd0cf'];
+    const COMP_LINE_WIDTH = 1.3;
+
+    // Elements fetched for comp sites — a light subset (not the full
+    // superset) since comps exist to compare core snowpack conditions
+    // against the primary site, not to replicate every diagnostic channel.
+    const COMP_ELEMENTS = ['WTEQ', 'SNWD', 'PREC', 'TOBS'];
+
+    // Display groups, in panel order. `elements` = one or more fixed named
+    // series sharing a panel (e.g. avg/max wind speed). `depthElement` = a
+    // single element code whose sensors span multiple heightDepths (soil
+    // moisture/temp, the snowpack temperature profile, etc.) — every depth
+    // the site reports gets its own line, discovered at fetch time rather
+    // than hardcoded, so this generalizes across sites in the suite.
+    // `compCode`, when present, overlays each Comps site's series for that
+    // element code (from COMP_ELEMENTS) as a lighter line on the same panel.
+    const PANEL_GROUPS = [
+      { title: 'Snow Water Equivalent', unit: 'in', compCode: 'WTEQ',
+        elements: [{ code: 'WTEQ', name: 'SWE', color: PRIMARY_BLUE }] },
+      { title: 'Snow Depth', unit: 'in', compCode: 'SNWD',
+        elements: [{ code: 'SNWD', name: 'Depth', color: PRIMARY_BLUE }] },
+      { title: 'Accumulated Precipitation', unit: 'in', compCode: 'PREC',
+        elements: [{ code: 'PREC', name: 'Precip', color: PRIMARY_BLUE }] },
+      { title: 'Incremental Precipitation', unit: 'in', elements: [{ code: 'PRCP', name: 'Precip Inc', color: PRIMARY_BLUE }] },
+      { title: 'Air Temperature', unit: '°F', compCode: 'TOBS', elements: [
+          { code: 'TOBS', name: 'Observed', color: '#d9534f' },
+          { code: 'TMAX', name: 'Max', color: '#e6194B' },
+          { code: 'TMIN', name: 'Min', color: '#4363d8' },
+          { code: 'TAVG', name: 'Avg', color: '#f0a500' }
+        ] },
+      { title: 'Relative Humidity', unit: '%', elements: [
+          { code: 'RHUM', name: 'RHUM', color: PRIMARY_BLUE },
+          { code: 'RHUMV', name: 'RHUMV', color: '#8e44ad' }
+        ] },
+      { title: 'Wind Speed', unit: 'mph', elements: [
+          { code: 'WSPDV', name: 'Avg', color: PRIMARY_BLUE },
+          { code: 'WSPDX', name: 'Max', color: '#d9534f' }
+        ] },
+      { title: 'Wind Direction', unit: '° from N', elements: [{ code: 'WDIRV', name: 'Dir', color: PRIMARY_BLUE }] },
+      { title: 'Soil Moisture', unit: '%', depthElement: 'SMS' },
+      { title: 'Soil Temperature', unit: '°F', depthElement: 'STO' },
+      { title: 'Snowpack / Above-Snow Temperature Profile', unit: '°F', depthElement: 'PTEMP', gradient: true, tall: true,
+        note: 'One sensor per heightDepth (inches; negative = below ground, 0 = surface). Depths above the current snow surface track air temperature; depths within the pack are insulated and smoother.' },
+      { title: 'Shortwave Radiation', unit: 'W/m²', elements: [
+          { code: 'SWINV', name: 'Incoming', color: PRIMARY_BLUE },
+          { code: 'SWOTV', name: 'Outgoing (reflected)', color: '#f0a500' }
+        ] },
+      { title: 'Longwave Radiation', unit: 'W/m²', elements: [
+          { code: 'LWINV', name: 'Incoming', color: PRIMARY_BLUE },
+          { code: 'LWOTV', name: 'Outgoing', color: '#f0a500' }
+        ] },
+      { title: 'Soil Sensor — RDC (raw, unitless)', unit: '', depthElement: 'RDC',
+        note: 'Raw resistive/dielectric divider readout underlying the soil-moisture calibration — diagnostic, included when the site reports it.' },
+      { title: 'Soil Sensor — SAL', unit: 'g/L', depthElement: 'SAL',
+        note: 'Soil solution salinity/conductivity channel — diagnostic, included when the site reports it.' },
+      { title: 'Station Battery Voltage', unit: 'V', elements: [{ code: 'BATT', name: 'Battery', color: PRIMARY_BLUE }],
+        note: 'Not snowpack data, but included since it’s in the hourly set.' }
+    ];
+
+    // "New snow" panels: net change since the start of the analysis window
+    // (value[i] - value[0] for whichever hourly points the site reports),
+    // not hour-to-hour deltas — the point is "where do I stand vs. when this
+    // window started," same as the raw panels below but zeroed at the start.
+    // Rendered before PANEL_GROUPS per the requested order (snow depth first).
+    const DELTA_PANELS = [
+      { title: 'Change in Snow Depth (since window start)', unit: 'in', code: 'SNWD', compCode: 'SNWD', color: PRIMARY_BLUE },
+      { title: 'Change in SWE (since window start)', unit: 'in', code: 'WTEQ', compCode: 'WTEQ', color: PRIMARY_BLUE }
+    ];
+
+    // Every element code the PRIMARY site fetch asks for, queried in one
+    // request. Codes the site doesn't report simply come back absent from
+    // the response (confirmed empirically) rather than erroring the request,
+    // so it's safe to always ask for the full superset.
+    const ELEMENTS_QUERY = PANEL_GROUPS
+      .flatMap(g => g.elements ? g.elements.map(e => e.code) : [g.depthElement + ':*'])
+      .join(',');
+    const COMP_ELEMENTS_QUERY = COMP_ELEMENTS.join(',');
+
+    const dataPlotlyConfig = { displayModeBar: false, scrollZoom: false, responsive: true };
+    const DATA_BASE_LAYOUT = {
+      margin: { l: 44, r: 12, t: 8, b: 28 },
+      font: { family: 'Arial, sans-serif', size: 10 },
+      showlegend: false,
+      xaxis: { showgrid: true, gridcolor: '#eee', tickfont: { size: 9 } },
+      yaxis: { showgrid: true, gridcolor: '#eee', tickfont: { size: 9 } },
+      plot_bgcolor: 'white',
+      paper_bgcolor: 'white'
+    };
+
+    // Blue -> red gradient by index, used for the PTEMP depth profile so
+    // color reads as "how high above the snow surface" rather than an
+    // arbitrary series order (see PANEL_GROUPS' `gradient` flag).
+    function depthColor(i, n) {
+      const t = n > 1 ? i / (n - 1) : 0;
+      const r = Math.round(47 + t * (217 - 47));
+      const g = Math.round(128 + t * (83 - 128));
+      const b = Math.round(237 + t * (79 - 237));
+      return `rgb(${r},${g},${b})`;
+    }
+
+    function addDaysUTC(dateStr, delta) {
+      const d = new Date(dateStr + 'T00:00:00Z');
+      d.setUTCDate(d.getUTCDate() + delta);
+      return d.toISOString().slice(0, 10);
+    }
+
+    // "N days ending on endDateStr" -> the begin/end query params to send the
+    // AWDB API (which treats endDate as the 00:00 timestamp of that date, so
+    // querying one day past the desired end pulls in that whole last day's
+    // hours). Returned series are trimmed back to <= endDateStr 23:59 before
+    // plotting, in renderDataPanels().
+    function computeQueryRange(endDateStr, days) {
+      return {
+        beginDate: addDaysUTC(endDateStr, -(days - 1)),
+        endDateQuery: addDaysUTC(endDateStr, 1)
+      };
+    }
+
+    // Legend items with a comp site's name ("Ben Lomond Peak (332)") run much
+    // wider than the short primary-series labels ("SWE", "Max", "Primary
+    // site") — used below to estimate how many legend items fit per row.
+    const LEGEND_ITEM_PX_LONG = 150;
+    const LEGEND_ITEM_PX_SHORT = 75;
+    const LEGEND_ROW_PX = 13;
+
+    // The old fixed top-margin legend (y: 1.15, margin.t: 8) had no room to
+    // wrap: on a narrow screen a 6-8-trace legend (primary + up to 5 comps)
+    // wraps to 2-3 rows and those rows spilled straight down over the top of
+    // the chart. Fix: put the legend BELOW the plot instead, and grow both
+    // the panel's height and its bottom margin by an estimate of how many
+    // rows it'll actually wrap to (measured against the panel's real
+    // on-screen width), so the extra rows get their own space instead of
+    // overlapping data.
+    function addDataPanel(container, id, title, note, tall, traces, unit, showLegend) {
+      const panel = document.createElement('div');
+      panel.className = 'panel';
+      panel.innerHTML = `
+        <div class="panel-title">${title}</div>
+        ${note ? `<div class="panel-note">${note}</div>` : ''}
+        <div id="${id}" class="plot-box${tall ? ' tall' : ''}"></div>
+      `;
+      container.appendChild(panel);
+
+      const plotEl = document.getElementById(id);
+      const baseHeight = tall ? 320 : 220;
+      // Growing marginB by exactly the same amount we grow the container
+      // keeps the actual data-plotting area this constant height, so the
+      // legend offset below only ever needs to account for it, not for
+      // whatever the panel's total height happens to be.
+      const plotAreaHeight = baseHeight - DATA_BASE_LAYOUT.margin.t - DATA_BASE_LAYOUT.margin.b;
+      let marginB = DATA_BASE_LAYOUT.margin.b;
+      let legend = { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.04, yanchor: 'top', font: { size: 9 } };
+
+      if (showLegend && traces.length) {
+        const width = plotEl.clientWidth || container.clientWidth || 300;
+        const hasLongLabels = traces.some(t => t.name && t.name.length >= 15);
+        const itemPx = hasLongLabels ? LEGEND_ITEM_PX_LONG : LEGEND_ITEM_PX_SHORT;
+        const itemsPerRow = Math.max(1, Math.floor(width / itemPx));
+        const rows = Math.max(1, Math.ceil(traces.length / itemsPerRow));
+        const extraHeight = rows * LEGEND_ROW_PX + 16;
+        plotEl.style.height = `${baseHeight + extraHeight}px`;
+        marginB = DATA_BASE_LAYOUT.margin.b + extraHeight;
+        // Clear the x-axis tick-label band (the original bottom margin, plus
+        // a small buffer) before the legend starts, expressed as a fraction
+        // of the plot area since that's what Plotly's legend `y` is relative
+        // to — a fixed fraction like -0.04 works for a tall plot area but is
+        // nowhere near enough clearance on a short one.
+        legend.y = -((DATA_BASE_LAYOUT.margin.b + 10) / plotAreaHeight);
+      }
+
+      Plotly.newPlot(id, traces, Object.assign({}, DATA_BASE_LAYOUT, {
+        showlegend: !!showLegend,
+        legend,
+        margin: Object.assign({}, DATA_BASE_LAYOUT.margin, { b: marginB }),
+        yaxis: Object.assign({}, DATA_BASE_LAYOUT.yaxis, { title: { text: unit, font: { size: 9 } } })
+      }), dataPlotlyConfig);
+    }
+
+    // Parses the Comps field into resolved { id, name, state } site objects,
+    // deduped, excluding the primary site and anything not in SNOTEL_SITES
+    // (comps are drawn from the same preloaded local dataset as the map).
+    function resolveCompSites(rawInput, primarySiteId) {
+      const ids = rawInput.split(',').map(s => s.trim()).filter(Boolean);
+      const seen = new Set();
+      const resolved = [];
+      const unknown = [];
+      ids.forEach(id => {
+        if (id === primarySiteId || seen.has(id)) return;
+        seen.add(id);
+        const site = SNOTEL_SITES.find(s => s.id === id);
+        if (site) resolved.push(site);
+        else unknown.push(id);
+      });
+      return { resolved, unknown };
+    }
+
+    // value[i] - value[0]: net change since the first point in the window,
+    // not hour-to-hour deltas (see DELTA_PANELS comment above).
+    function computeDeltaSeries(values) {
+      if (!values || !values.length) return null;
+      const base = values[0].value;
+      return { x: values.map(v => v.date), y: values.map(v => v.value - base) };
+    }
+
+    function compTrace(x, y, name, color) {
+      return {
+        x, y, type: 'scatter', mode: 'lines', name,
+        line: { color, width: COMP_LINE_WIDTH },
+        opacity: 0.85,
+        hovertemplate: `${name}<br>%{x}<br>%{y}<extra></extra>`
+      };
+    }
+
+    function renderDataPanels(dataArr, compsData, resolvedComps, endDateStr) {
+      const container = document.getElementById('dataPanels');
+      container.innerHTML = '';
+      const endBound = endDateStr + ' 23:59';
+
+      // Group the flat primary-site API response by element code (and, for
+      // multi-depth elements, keep each heightDepth's series separate).
+      const byCode = {};
+      dataArr.forEach(entry => {
+        const code = entry.stationElement.elementCode;
+        const hd = entry.stationElement.heightDepth;
+        const values = (entry.values || []).filter(v => v.date <= endBound);
+        if (!byCode[code]) byCode[code] = [];
+        byCode[code].push({ heightDepth: hd, values });
+      });
+
+      // compsData: { siteId: { code: [{date,value}, ...] } }, already filtered
+      // to endBound by the caller. Builds the lighter comp traces for a given
+      // element code, one per resolved comp site that actually returned data.
+      function compTracesFor(code) {
+        const traces = [];
+        resolvedComps.forEach((site, i) => {
+          const values = compsData[site.id] && compsData[site.id][code];
+          if (values && values.length) {
+            const label = `${site.name} (${site.id})`;
+            traces.push(compTrace(values.map(v => v.date), values.map(v => v.value), label, COMP_PALETTE[i % COMP_PALETTE.length]));
+          }
+        });
+        return traces;
+      }
+
+      function compDeltaTracesFor(code) {
+        const traces = [];
+        resolvedComps.forEach((site, i) => {
+          const values = compsData[site.id] && compsData[site.id][code];
+          const delta = computeDeltaSeries(values);
+          if (delta) {
+            const label = `${site.name} (${site.id})`;
+            traces.push(compTrace(delta.x, delta.y, label, COMP_PALETTE[i % COMP_PALETTE.length]));
+          }
+        });
+        return traces;
+      }
+
+      let panelCount = 0;
+
+      // "New snow" delta panels first, per the requested order (snow depth,
+      // then SWE), each with the primary site's delta plus every comp's.
+      DELTA_PANELS.forEach(dp => {
+        const primarySeries = byCode[dp.code] && byCode[dp.code][0] && byCode[dp.code][0].values;
+        const delta = computeDeltaSeries(primarySeries);
+        const traces = [];
+        if (delta) {
+          traces.push({
+            x: delta.x, y: delta.y, type: 'scatter', mode: 'lines', name: 'Primary site',
+            line: { color: dp.color, width: PRIMARY_LINE_WIDTH }
+          });
+        }
+        traces.push(...compDeltaTracesFor(dp.compCode));
+        if (traces.length) {
+          panelCount++;
+          addDataPanel(container, `dp-${panelCount}`, dp.title,
+            'Net change from the first hourly reading in the analysis window to each later one — not hour-to-hour deltas.',
+            false, traces, dp.unit, true);
+        }
+      });
+
+      PANEL_GROUPS.forEach(group => {
+        if (group.elements) {
+          const traces = [];
+          group.elements.forEach(e => {
+            const series = byCode[e.code];
+            if (series && series[0] && series[0].values.length) {
+              traces.push({
+                x: series[0].values.map(v => v.date),
+                y: series[0].values.map(v => v.value),
+                type: 'scatter', mode: 'lines', name: e.name,
+                line: { color: e.color, width: PRIMARY_LINE_WIDTH }
+              });
+            }
+          });
+          if (group.compCode) traces.push(...compTracesFor(group.compCode));
+          if (traces.length) {
+            panelCount++;
+            addDataPanel(container, `dp-${panelCount}`, group.title, group.note, group.tall, traces, group.unit, traces.length > 1);
+          }
+        } else if (group.depthElement) {
+          const series = (byCode[group.depthElement] || []).filter(s => s.values.length);
+          if (series.length) {
+            const sorted = series.slice().sort((a, b) => a.heightDepth - b.heightDepth);
+            const traces = sorted.map((s, i) => ({
+              x: s.values.map(v => v.date),
+              y: s.values.map(v => v.value),
+              type: 'scatter', mode: 'lines', name: `${s.heightDepth} in`,
+              line: { color: group.gradient ? depthColor(i, sorted.length) : DEPTH_PALETTE[i % DEPTH_PALETTE.length], width: 1.6 }
+            }));
+            panelCount++;
+            addDataPanel(container, `dp-${panelCount}`, group.title, group.note, group.tall, traces, group.unit, true);
+          }
+        }
+      });
+
+      return panelCount;
+    }
+
+    async function fetchSiteData(site, elementsQuery, beginDate, endDateQuery) {
+      const triplet = `${site.id}:${site.state}:SNTL`;
+      const url = `${AWDB_DATA_URL}?stationTriplets=${encodeURIComponent(triplet)}&elements=${encodeURIComponent(elementsQuery)}&duration=HOURLY&beginDate=${beginDate}&endDate=${endDateQuery}`;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const json = await resp.json();
+      return (json.length && json[0].data) ? json[0].data : [];
+    }
+
+    async function loadSnowpackData(site) {
+      const dataStatus = document.getElementById('dataStatusMsg');
+      const endDateStr = document.getElementById('endDate').value;
+      const days = parseInt(document.getElementById('daysToAnalyze').value) || 14;
+
+      if (!endDateStr) {
+        dataStatus.innerText = 'Set an Analysis End Date to load data.';
+        return;
+      }
+
+      const { beginDate, endDateQuery } = computeQueryRange(endDateStr, days);
+      const endBound = endDateStr + ' 23:59';
+      const { resolved: resolvedComps, unknown: unknownComps } = resolveCompSites(document.getElementById('compSites').value, site.id);
+
+      document.getElementById('dataPanels').innerHTML = '';
+      dataStatus.innerText = `Fetching hourly data for ${site.name}${resolvedComps.length ? ` + ${resolvedComps.length} comp site(s)` : ''} (${beginDate} to ${endDateStr})...`;
+
+      try {
+        const [primaryData, compResults] = await Promise.all([
+          fetchSiteData(site, ELEMENTS_QUERY, beginDate, endDateQuery),
+          Promise.allSettled(resolvedComps.map(s => fetchSiteData(s, COMP_ELEMENTS_QUERY, beginDate, endDateQuery)))
+        ]);
+
+        if (!primaryData.length) {
+          dataStatus.innerText = `No hourly data returned for ${site.name} in that window — it may not report hourly, or the range may be outside its record.`;
+          return;
+        }
+
+        // compsData: { siteId: { code: [{date,value}, ...] } }
+        const compsData = {};
+        const failedComps = [];
+        resolvedComps.forEach((s, i) => {
+          const result = compResults[i];
+          if (result.status !== 'fulfilled') { failedComps.push(s.id); return; }
+          const byCode = {};
+          result.value.forEach(entry => {
+            const values = (entry.values || []).filter(v => v.date <= endBound);
+            byCode[entry.stationElement.elementCode] = values;
+          });
+          compsData[s.id] = byCode;
+        });
+
+        const panelCount = renderDataPanels(primaryData, compsData, resolvedComps, endDateStr);
+
+        const notes = [];
+        if (unknownComps.length) notes.push(`comp ID${unknownComps.length === 1 ? '' : 's'} not in local dataset: ${unknownComps.join(', ')}`);
+        if (failedComps.length) notes.push(`comp fetch failed for: ${failedComps.join(', ')}`);
+        const noteStr = notes.length ? ` (${notes.join('; ')})` : '';
+
+        dataStatus.innerText = panelCount
+          ? `${site.name}: ${panelCount} panel${panelCount === 1 ? '' : 's'} plotted, ${beginDate} to ${endDateStr} (station-local time)${noteStr}.`
+          : `Got a response for ${site.name}, but none of the tracked element groups had data in this window${noteStr}.`;
+      } catch (err) {
+        dataStatus.innerText = `Data fetch failed: ${err.message}`;
+        console.error('Powder Dash data fetch error:', err);
+      }
+    }
+
+    /* =====================================================================
+       INIT
+       ===================================================================== */
+    setDefaultEndDate();
+    loadSite();
+  </script>
+
+</body>
+</html>
