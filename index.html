@@ -1384,7 +1384,7 @@
 
         // Lifts are a separate, non-fatal fetch so the terrain shows first.
         try {
-          const lifts = await fetchLifts(bbox, terrainState);
+          const lifts = buildLiftPaths(await fetchLiftsRaw(site), terrainState);
           if (seq !== terrainLoadSeq) return;
           terrainState.lifts = lifts;
           renderTerrain();
@@ -1410,36 +1410,79 @@
        LIFT_OFFSET_FT above ground so it never clips into a bump) and
        clipped to the box.
        --------------------------------------------------------------------- */
+    // overpass-api.de is the main instance and the only one that reliably
+    // answers cross-origin; when it's busy it replies 429/504 *without* CORS
+    // headers, which Chrome reports as a CORS block. So: retry it with
+    // backoff, fall back to a mirror, and cache successful results per site
+    // (lifts almost never change) so a busy server only matters once.
     const OVERPASS_URLS = [
+      'https://overpass-api.de/api/interpreter',
+      'https://overpass-api.de/api/interpreter',
       'https://overpass-api.de/api/interpreter',
       'https://overpass.kumi.systems/api/interpreter'
     ];
-    const LIFT_TYPES = 'chair_lift|gondola|cable_car|mixed_lift|drag_lift|t-bar|j-bar|platter|rope_tow|magic_carpet';
-    const LIFT_COLOR = '#d9534f';   // Dash red — same as the primary-site marker
-    const LIFT_OFFSET_FT = 40;
-    const LIFT_TYPE_NAMES = {
-      chair_lift: 'Chairlift', gondola: 'Gondola', cable_car: 'Tram', mixed_lift: 'Chair/gondola',
-      drag_lift: 'Surface lift', 't-bar': 'T-bar', 'j-bar': 'J-bar', platter: 'Platter', rope_tow: 'Rope tow', magic_carpet: 'Magic carpet'
-    };
+    const OVERPASS_BACKOFF_MS = [0, 2000, 5000, 0];
+    const OVERPASS_TIMEOUT_MS = 20000;
+    const LIFT_CACHE_PREFIX = 'powderdash.lifts.v1.';
+    const LIFT_CACHE_TTL_MS = 30 * 24 * 3600 * 1000;
+    const LIFT_FETCH_RADIUS_MI = 3.5;   // covers the largest (6 x 6 mi) box, so box changes reuse the cache
+    const liftMemCache = {};
 
-    async function fetchLifts(bbox, st) {
-      const q = `[out:json][timeout:25];way["aerialway"~"^(${LIFT_TYPES})$"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});out geom;`;
+    function readLiftCache(siteId) {
+      if (liftMemCache[siteId]) return liftMemCache[siteId];
+      try {
+        const c = JSON.parse(localStorage.getItem(LIFT_CACHE_PREFIX + siteId) || 'null');
+        if (c && Date.now() - c.t < LIFT_CACHE_TTL_MS) return (liftMemCache[siteId] = c.lifts);
+      } catch (e) { /* storage unavailable — just refetch */ }
+      return null;
+    }
+    function writeLiftCache(siteId, lifts) {
+      liftMemCache[siteId] = lifts;
+      try { localStorage.setItem(LIFT_CACHE_PREFIX + siteId, JSON.stringify({ t: Date.now(), lifts })); } catch (e) { /* ignore */ }
+    }
+
+    // Raw lift geometry (lat/lon) within LIFT_FETCH_RADIUS_MI of the site.
+    async function fetchLiftsRaw(site) {
+      const cached = readLiftCache(site.id);
+      if (cached) return cached;
+
+      const dLat = LIFT_FETCH_RADIUS_MI * M_PER_MILE / 111320;
+      const dLon = LIFT_FETCH_RADIUS_MI * M_PER_MILE / (111320 * Math.cos(site.lat * Math.PI / 180));
+      const q = `[out:json][timeout:25];way["aerialway"~"^(${LIFT_TYPES})$"](${site.lat - dLat},${site.lon - dLon},${site.lat + dLat},${site.lon + dLon});out geom;`;
       let json = null, lastErr = null;
-      for (const url of OVERPASS_URLS) {
+      for (let k = 0; k < OVERPASS_URLS.length && !json; k++) {
+        if (OVERPASS_BACKOFF_MS[k]) await new Promise(r => setTimeout(r, OVERPASS_BACKOFF_MS[k]));
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), OVERPASS_TIMEOUT_MS);
         try {
-          const resp = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q),
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+          const resp = await fetch(`${OVERPASS_URLS[k]}?data=${encodeURIComponent(q)}`, { signal: ac.signal });
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           json = await resp.json();
-          break;
-        } catch (e) { lastErr = e; }
+        } catch (e) {
+          lastErr = e.name === 'AbortError' ? new Error('timed out') : e;
+        } finally {
+          clearTimeout(timer);
+        }
       }
-      if (!json) throw lastErr || new Error('no response');
+      if (!json) throw new Error(`OpenStreetMap lift server busy (${lastErr ? lastErr.message : 'no response'}) — click Load Terrain to retry`);
 
+      const lifts = (json.elements || [])
+        .filter(el => el.type === 'way' && el.geometry && el.geometry.length > 1)
+        .map(el => ({
+          name: (el.tags && el.tags.name) || '(unnamed lift)',
+          aerialway: el.tags && el.tags.aerialway,
+          geometry: el.geometry.map(g => ({ lat: g.lat, lon: g.lon }))
+        }));
+      writeLiftCache(site.id, lifts);
+      return lifts;
+    }
+
+    // Drapes raw lifts onto the current terrain and clips them to its box.
+    function buildLiftPaths(rawLifts, st) {
+      const bbox = st.bbox;
       const inBox = (lat, lon) => lat >= bbox.south && lat <= bbox.north && lon >= bbox.west && lon <= bbox.east;
       const stepM = 15;
-      return (json.elements || []).filter(el => el.type === 'way' && el.geometry && el.geometry.length > 1).map(el => {
-        const tags = el.tags || {};
+      return rawLifts.map(el => {
         // Densify each segment, keeping only points inside the box; a
         // stretch outside the box becomes a gap (null) in the line.
         const pts = [];
@@ -1458,8 +1501,8 @@
         }
         while (pts.length && pts[pts.length - 1] === null) pts.pop();
         return {
-          name: tags.name || '(unnamed lift)',
-          type: LIFT_TYPE_NAMES[tags.aerialway] || tags.aerialway,
+          name: el.name,
+          type: LIFT_TYPE_NAMES[el.aerialway] || el.aerialway,
           pts
         };
       }).filter(l => l.pts.filter(Boolean).length > 1);
@@ -1500,10 +1543,10 @@
       [35 / 60, '#e0453a'], [45 / 60, '#e0453a'],
       [45 / 60, '#8e44ad'], [1, '#5b2c6f']
     ];
-    // Cyclic: N blue -> E yellow -> S red -> W green -> N blue.
+    // Cyclic: N blue -> E green -> S red -> W yellow -> N blue.
     const ASPECT_COLORSCALE = [
-      [0, '#2f6fd6'], [0.125, '#45b0c9'], [0.25, '#f2d24b'], [0.375, '#f29a3d'],
-      [0.5, '#d9453a'], [0.625, '#b25ab8'], [0.75, '#5bb85b'], [0.875, '#3b8f9e'], [1, '#2f6fd6']
+      [0, '#2f6fd6'], [0.125, '#3b8f9e'], [0.25, '#5bb85b'], [0.375, '#b25ab8'],
+      [0.5, '#d9453a'], [0.625, '#f29a3d'], [0.75, '#f2d24b'], [0.875, '#45b0c9'], [1, '#2f6fd6']
     ];
     const ELEV_COLORSCALE = [
       [0, '#4f7942'], [0.3, '#9bbf73'], [0.55, '#d8c99b'], [0.8, '#a88f73'], [1, '#f5f5f5']
