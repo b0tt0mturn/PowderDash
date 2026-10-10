@@ -1389,7 +1389,7 @@
           terrainState.lifts = lifts;
           renderTerrain();
           status.innerText = baseMsg + (lifts.length
-            ? ` ${lifts.length} lift${lifts.length === 1 ? '' : 's'} in the box.`
+            ? ` ${lifts.length} lift${lifts.length === 1 ? '' : 's'} in the box${BUNDLED_LIFTS[site.id] ? ` (built-in lift map, OSM ${BUNDLED_LIFTS[site.id].asOf})` : ''}.`
             : ' No lifts mapped in this box.');
         } catch (e) {
           if (seq !== terrainLoadSeq) return;
@@ -1435,8 +1435,38 @@
     const LIFT_FETCH_RADIUS_MI = 3.5;   // covers the largest (6 x 6 mi) box, so box changes reuse the cache
     const liftMemCache = {};
 
+    // Lift geometry bundled into the file, so these sites never depend on
+    // the (often overloaded) Overpass server. Snapshot of OpenStreetMap
+    // aerialways within LIFT_FETCH_RADIUS_MI of the site; geometry is
+    // [lat, lon] pairs. Other sites still fetch live (and get cached).
+    const BUNDLED_LIFTS = {
+      '1300': { asOf: '2026-10-10', lifts: [
+        {"name":"Timberline","aerialway":"chair_lift","geometry":[[41.383458,-111.776798],[41.383243,-111.776634],[41.382806,-111.776333],[41.382416,-111.776064],[41.381025,-111.775107],[41.379587,-111.774118],[41.379058,-111.773754],[41.378508,-111.773376],[41.377953,-111.772994],[41.377505,-111.772686],[41.37701,-111.772345],[41.376408,-111.771931],[41.376015,-111.771661],[41.375735,-111.771468]]},
+        {"name":"Sunrise","aerialway":"platter","geometry":[[41.370354,-111.757255],[41.370404,-111.756823],[41.370454,-111.756319],[41.370515,-111.755758],[41.370582,-111.755185],[41.370654,-111.754575],[41.370727,-111.753902],[41.370817,-111.753189],[41.37091,-111.752456]]},
+        {"name":"Paradise Express","aerialway":"chair_lift","geometry":[[41.398848,-111.762283],[41.398445,-111.762444],[41.397716,-111.762735],[41.397016,-111.763014],[41.396303,-111.763299],[41.395698,-111.763541],[41.394419,-111.764052],[41.393495,-111.764421],[41.391606,-111.765196],[41.39004,-111.765839],[41.388771,-111.766356],[41.387757,-111.766757],[41.387388,-111.766906],[41.386996,-111.767065],[41.385791,-111.76755],[41.385036,-111.767853],[41.384344,-111.768132]]},
+        {"name":"Saddle Horn","aerialway":"rope_tow","geometry":[[41.37393,-111.770554],[41.375478,-111.771461]]},
+        {"name":"Hidden Lake Express","aerialway":"chair_lift","geometry":[[41.384421,-111.76011],[41.383916,-111.760277],[41.38315,-111.760527],[41.382182,-111.760848],[41.381209,-111.76117],[41.380119,-111.76153],[41.379136,-111.761855],[41.37854,-111.762053],[41.37762,-111.762357],[41.376563,-111.762707],[41.375348,-111.763109],[41.374218,-111.763482],[41.37296,-111.763899],[41.37174,-111.764302],[41.371188,-111.764485],[41.37072,-111.764639],[41.370347,-111.764763],[41.370026,-111.764869]]},
+        {"name":"Sundown","aerialway":"chair_lift","geometry":[[41.37663,-111.786573],[41.376419,-111.787027],[41.376105,-111.787708],[41.375756,-111.788473],[41.375361,-111.789246],[41.374994,-111.789996],[41.374792,-111.790377],[41.374339,-111.791237],[41.374022,-111.791874],[41.373873,-111.792167]]},
+        {"name":"Tiger","aerialway":"rope_tow","geometry":[[41.376603,-111.786339],[41.374929,-111.786811]]},
+        {"name":"Village Quad","aerialway":"chair_lift","geometry":[[41.36187,-111.756628],[41.361878,-111.756301],[41.361872,-111.755332],[41.361868,-111.754683],[41.36186,-111.753397],[41.361853,-111.752222],[41.361846,-111.75103],[41.361838,-111.749832],[41.361831,-111.748581],[41.361823,-111.747399],[41.361817,-111.746297],[41.36181,-111.745188],[41.361807,-111.744644],[41.361802,-111.743922],[41.361803,-111.743288]]},
+        {"name":"Mary's Quad","aerialway":"chair_lift","geometry":[[41.366501,-111.731948],[41.366649,-111.732547],[41.366772,-111.733041],[41.366907,-111.733586],[41.367184,-111.734706],[41.367448,-111.735771],[41.367797,-111.73718],[41.367996,-111.737985],[41.368276,-111.739115],[41.368425,-111.739715],[41.368623,-111.740516],[41.368927,-111.741742],[41.369178,-111.742759],[41.36936,-111.743493],[41.369515,-111.744119],[41.36966,-111.744704],[41.369745,-111.745045],[41.369844,-111.745447]]},
+        {"name":"Lightning Ridge","aerialway":"chair_lift","geometry":[[41.383358,-111.776847],[41.38467,-111.788725]]},
+        {"name":"Raintree","aerialway":"chair_lift","geometry":[[41.393795,-111.750397],[41.393027,-111.736429]]},
+        {"name":"Primetime Express","aerialway":"chair_lift","geometry":[[41.413056,-111.741079],[41.393143,-111.736024]]},
+        {"name":"Half Pint","aerialway":"chair_lift","geometry":[[41.35187,-111.745191],[41.356445,-111.735964]]},
+        {"name":"DMI","aerialway":"chair_lift","geometry":[[41.372137,-111.80597],[41.37358,-111.792381]]},
+        {"name":"Foxtrot","aerialway":"chair_lift","geometry":[[41.387879,-111.744639],[41.370374,-111.745911]]}
+      ] }
+    };
+
     function readLiftCache(siteId) {
       if (liftMemCache[siteId]) return liftMemCache[siteId];
+      if (BUNDLED_LIFTS[siteId]) {
+        return (liftMemCache[siteId] = BUNDLED_LIFTS[siteId].lifts.map(l => ({
+          name: l.name, aerialway: l.aerialway,
+          geometry: l.geometry.map(([lat, lon]) => ({ lat, lon }))
+        })));
+      }
       try {
         const c = JSON.parse(localStorage.getItem(LIFT_CACHE_PREFIX + siteId) || 'null');
         if (c && Date.now() - c.t < LIFT_CACHE_TTL_MS) return (liftMemCache[siteId] = c.lifts);
