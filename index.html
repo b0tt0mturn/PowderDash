@@ -1165,7 +1165,16 @@
        box (~7 m/px at these latitudes), then resample onto a regular grid
        at the chosen Detail spacing and derive slope and aspect from it.
        ===================================================================== */
-    const TERRAIN_TILE_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
+    // Same bucket, three endpoints, tried in order. The old path-style URL
+    // (s3.amazonaws.com/elevation-tiles-prod/...) resets connections
+    // intermittently (AWS is phasing path-style out), so the virtual-hosted
+    // endpoints come first and it's kept only as a last resort.
+    const TERRAIN_TILE_HOSTS = [
+      'https://elevation-tiles-prod.s3.amazonaws.com/terrarium',
+      'https://elevation-tiles-prod.s3.us-east-1.amazonaws.com/terrarium',
+      'https://s3.amazonaws.com/elevation-tiles-prod/terrarium'
+    ];
+    let terrainHostIdx = 0;   // sticks to whichever endpoint last worked
     const TERRAIN_ZOOM = 14;
     const TERRAIN_MAX_GRID = 360;          // cap per axis, keeps WebGL snappy
     const M_PER_MILE = 1609.344;
@@ -1182,14 +1191,32 @@
       return (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * Math.pow(2, z);
     }
 
-    function loadTileImage(z, x, y) {
+    function loadTileFrom(host, z, x, y) {
       return new Promise((resolve, reject) => {
         const img = new Image();
         img.crossOrigin = 'anonymous';
         img.onload = () => resolve(img);
-        img.onerror = () => reject(new Error(`tile ${z}/${x}/${y} failed to load`));
-        img.src = TERRAIN_TILE_URL.replace('{z}', z).replace('{x}', x).replace('{y}', y);
+        img.onerror = () => reject(new Error('load error'));
+        img.src = `${host}/${z}/${x}/${y}.png`;
       });
+    }
+
+    // Tries each endpoint (starting with the last one that worked), with one
+    // retry per endpoint, before giving up on a tile.
+    async function loadTileImage(z, x, y) {
+      for (let k = 0; k < TERRAIN_TILE_HOSTS.length; k++) {
+        const idx = (terrainHostIdx + k) % TERRAIN_TILE_HOSTS.length;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const img = await loadTileFrom(TERRAIN_TILE_HOSTS[idx], z, x, y);
+            terrainHostIdx = idx;
+            return img;
+          } catch (e) {
+            if (attempt === 0) await new Promise(r => setTimeout(r, 400));
+          }
+        }
+      }
+      throw new Error(`tile ${z}/${x}/${y} failed to load from all ${TERRAIN_TILE_HOSTS.length} endpoints — check network, VPN or an ad/privacy blocker for *.amazonaws.com`);
     }
 
     // Fetches every tile covering the lat/lon bbox and returns a sampler
