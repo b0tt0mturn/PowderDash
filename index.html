@@ -1422,6 +1422,13 @@
       'https://overpass.kumi.systems/api/interpreter'
     ];
     const OVERPASS_BACKOFF_MS = [0, 2000, 5000, 0];
+    const LIFT_TYPES = 'chair_lift|gondola|cable_car|mixed_lift|drag_lift|t-bar|j-bar|platter|rope_tow|magic_carpet';
+    const LIFT_COLOR = '#d9534f';   // Dash red — same as the primary-site marker
+    const LIFT_OFFSET_FT = 40;
+    const LIFT_TYPE_NAMES = {
+      chair_lift: 'Chairlift', gondola: 'Gondola', cable_car: 'Tram', mixed_lift: 'Chair/gondola',
+      drag_lift: 'Surface lift', 't-bar': 'T-bar', 'j-bar': 'J-bar', platter: 'Platter', rope_tow: 'Rope tow', magic_carpet: 'Magic carpet'
+    };
     const OVERPASS_TIMEOUT_MS = 20000;
     const LIFT_CACHE_PREFIX = 'powderdash.lifts.v1.';
     const LIFT_CACHE_TTL_MS = 30 * 24 * 3600 * 1000;
