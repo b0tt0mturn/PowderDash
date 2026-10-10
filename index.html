@@ -381,12 +381,18 @@
           </select>
         </div>
         <div class="control-group">
+          <label>Overlays:</label>
+          <label style="font-weight: normal; font-size: 11px; display: flex; align-items: center; gap: 4px; padding: 4px 0;">
+            <input type="checkbox" id="terrainShowLifts" checked onchange="renderTerrain()" style="width: auto; margin: 0;"> Lifts
+          </label>
+        </div>
+        <div class="control-group">
           <button class="btn" onclick="loadTerrainForCurrentSite()">Load Terrain</button>
         </div>
       </div>
       <div id="terrainStatusMsg" class="status-msg" style="text-align: left; margin-top: 0;">Ready.</div>
       <div id="terrainPlot"></div>
-      <div class="section-note">Elevation: AWS Terrain Tiles (USGS 3DEP in the US). Drag to rotate, scroll to zoom, right-drag to pan. Box is centered on the primary SNOTEL site (red marker).</div>
+      <div class="section-note">Elevation: AWS Terrain Tiles (USGS 3DEP in the US). Lifts: © OpenStreetMap contributors. Drag to rotate, scroll to zoom, right-drag to pan. Box is centered on the primary SNOTEL site (red marker).</div>
     </div>
   </div>
 
@@ -1350,15 +1356,124 @@
         let zMin = Infinity, zMax = -Infinity;
         zFt.forEach(r => r.forEach(v => { if (v < zMin) zMin = v; if (v > zMax) zMax = v; }));
 
-        terrainState = { site, wMi, hMi, xMi, yMi, zFt, slope, aspect, gradX, gradY, centerFt, zMin, zMax, spacing: Math.max(dx, dy) };
+        // Projection helpers (lat/lon -> miles E/N of the station) and the
+        // elevation sampler are kept so overlays can be draped on later.
+        const toXMi = lon => (lon - site.lon) * mPerDegLon / M_PER_MILE;
+        const toYMi = lat => (lat - site.lat) * mPerDegLat / M_PER_MILE;
+        terrainState = { site, wMi, hMi, xMi, yMi, zFt, slope, aspect, gradX, gradY, centerFt, zMin, zMax, spacing: Math.max(dx, dy),
+                         bbox, elevAt, toXMi, toYMi, lifts: null };
         renderTerrain();
-        status.innerText = `${site.name}: ${wMi} × ${hMi} mi, ${nx} × ${ny} grid (~${Math.round(Math.max(dx, dy))} m spacing). ` +
+        const baseMsg = `${site.name}: ${wMi} × ${hMi} mi, ${nx} × ${ny} grid (~${Math.round(Math.max(dx, dy))} m spacing). ` +
           `Elevation ${Math.round(zMin).toLocaleString()}–${Math.round(zMax).toLocaleString()} ft; station sits at ~${Math.round(centerFt).toLocaleString()} ft on the model (listed ${site.elevFt.toLocaleString()} ft).`;
+        status.innerText = baseMsg + ' Loading lifts...';
+
+        // Lifts are a separate, non-fatal fetch so the terrain shows first.
+        try {
+          const lifts = await fetchLifts(bbox, terrainState);
+          if (seq !== terrainLoadSeq) return;
+          terrainState.lifts = lifts;
+          renderTerrain();
+          status.innerText = baseMsg + (lifts.length
+            ? ` ${lifts.length} lift${lifts.length === 1 ? '' : 's'} in the box.`
+            : ' No lifts mapped in this box.');
+        } catch (e) {
+          if (seq !== terrainLoadSeq) return;
+          console.error('Powder Dash lift fetch error:', e);
+          status.innerText = baseMsg + ` Lifts unavailable (${e.message}).`;
+        }
       } catch (err) {
         if (seq !== terrainLoadSeq) return;
         status.innerText = `Terrain load failed: ${err.message}`;
         console.error('Powder Dash terrain error:', err);
       }
+    }
+
+    /* ---------------------------------------------------------------------
+       Lift lines from OpenStreetMap (Overpass API — CORS-enabled, no key),
+       so this works at any resort that's mapped, not just Powder Mountain.
+       Each lift is draped on the terrain (densified every ~15 m, lifted
+       LIFT_OFFSET_FT above ground so it never clips into a bump) and
+       clipped to the box.
+       --------------------------------------------------------------------- */
+    const OVERPASS_URLS = [
+      'https://overpass-api.de/api/interpreter',
+      'https://overpass.kumi.systems/api/interpreter'
+    ];
+    const LIFT_TYPES = 'chair_lift|gondola|cable_car|mixed_lift|drag_lift|t-bar|j-bar|platter|rope_tow|magic_carpet';
+    const LIFT_COLOR = '#d9534f';   // Dash red — same as the primary-site marker
+    const LIFT_OFFSET_FT = 40;
+    const LIFT_TYPE_NAMES = {
+      chair_lift: 'Chairlift', gondola: 'Gondola', cable_car: 'Tram', mixed_lift: 'Chair/gondola',
+      drag_lift: 'Surface lift', 't-bar': 'T-bar', 'j-bar': 'J-bar', platter: 'Platter', rope_tow: 'Rope tow', magic_carpet: 'Magic carpet'
+    };
+
+    async function fetchLifts(bbox, st) {
+      const q = `[out:json][timeout:25];way["aerialway"~"^(${LIFT_TYPES})$"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});out geom;`;
+      let json = null, lastErr = null;
+      for (const url of OVERPASS_URLS) {
+        try {
+          const resp = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q),
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          json = await resp.json();
+          break;
+        } catch (e) { lastErr = e; }
+      }
+      if (!json) throw lastErr || new Error('no response');
+
+      const inBox = (lat, lon) => lat >= bbox.south && lat <= bbox.north && lon >= bbox.west && lon <= bbox.east;
+      const stepM = 15;
+      return (json.elements || []).filter(el => el.type === 'way' && el.geometry && el.geometry.length > 1).map(el => {
+        const tags = el.tags || {};
+        // Densify each segment, keeping only points inside the box; a
+        // stretch outside the box becomes a gap (null) in the line.
+        const pts = [];
+        for (let k = 0; k < el.geometry.length - 1; k++) {
+          const a = el.geometry[k], b = el.geometry[k + 1];
+          const segM = getDistanceMiles(a.lat, a.lon, b.lat, b.lon) * M_PER_MILE;
+          const n = Math.max(1, Math.ceil(segM / stepM));
+          for (let t = (k === 0 ? 0 : 1); t <= n; t++) {
+            const lat = a.lat + (b.lat - a.lat) * t / n, lon = a.lon + (b.lon - a.lon) * t / n;
+            if (inBox(lat, lon)) {
+              pts.push({ x: st.toXMi(lon), y: st.toYMi(lat), z: st.elevAt(lat, lon) * FT_PER_M + LIFT_OFFSET_FT });
+            } else if (pts.length && pts[pts.length - 1] !== null) {
+              pts.push(null);
+            }
+          }
+        }
+        while (pts.length && pts[pts.length - 1] === null) pts.pop();
+        return {
+          name: tags.name || '(unnamed lift)',
+          type: LIFT_TYPE_NAMES[tags.aerialway] || tags.aerialway,
+          pts
+        };
+      }).filter(l => l.pts.filter(Boolean).length > 1);
+    }
+
+    // All lifts in one line trace (null-separated, for speed) plus a label
+    // at each lift's highest in-box point (usually the top terminal).
+    function liftTraces(lifts) {
+      const x = [], y = [], z = [], hover = [];
+      const lx = [], ly = [], lz = [], lt = [];
+      lifts.forEach(l => {
+        let top = null;
+        l.pts.forEach(p => {
+          if (p === null) { x.push(null); y.push(null); z.push(null); hover.push(''); return; }
+          x.push(p.x); y.push(p.y); z.push(p.z);
+          hover.push(`${l.name}<br>${l.type}`);
+          if (!top || p.z > top.z) top = p;
+        });
+        x.push(null); y.push(null); z.push(null); hover.push('');
+        if (top) { lx.push(top.x); ly.push(top.y); lz.push(top.z + 30); lt.push(l.name); }
+      });
+      return [
+        { type: 'scatter3d', mode: 'lines', x, y, z, customdata: hover,
+          line: { color: LIFT_COLOR, width: 5 }, connectgaps: false,
+          hovertemplate: '%{customdata}<extra></extra>', showlegend: false },
+        { type: 'scatter3d', mode: 'text', x: lx, y: ly, z: lz, text: lt,
+          textfont: { size: 10, color: '#8b1e1a' }, textposition: 'top center',
+          hoverinfo: 'skip', showlegend: false }
+      ];
     }
 
     // Slope bins follow the usual avalanche-terrain shading (CalTopo-style):
@@ -1477,7 +1592,10 @@
         uirevision: `${st.site.id}-${st.wMi}-${st.hMi}`   // keep the user's camera across recolors
       };
 
-      Plotly.react(plotEl, [surface, marker], layout, { displaylogo: false, responsive: true, modeBarButtonsToRemove: ['toImage'] });
+      const traces = [surface, marker];
+      if (st.lifts && st.lifts.length && document.getElementById('terrainShowLifts').checked) traces.push(...liftTraces(st.lifts));
+
+      Plotly.react(plotEl, traces, layout, { displaylogo: false, responsive: true, modeBarButtonsToRemove: ['toImage'] });
     }
 
     /* =====================================================================
