@@ -236,6 +236,20 @@
     }
     .plot-box.tall { height: 320px; }
 
+    /* Terrain 3D panel */
+    .terrain-controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+      gap: 6px 10px;
+      align-items: end;
+      margin-bottom: 6px;
+    }
+    .terrain-controls .btn { margin-top: 0; }
+    #terrainPlot {
+      width: 100%;
+      height: 560px;
+    }
+
     @media (min-width: 768px) {
       body { padding: 15px; }
       h2 { font-size: 1.5rem; text-align: left; }
@@ -245,6 +259,7 @@
     @media (max-width: 767px) {
       .map-controls-row { flex-direction: column; }
       #map { min-height: 280px; }
+      #terrainPlot { height: 420px; }
     }
   </style>
 </head>
@@ -312,6 +327,52 @@
         </div>
 
       </div>
+    </div>
+  </div>
+
+  <div class="grid-container">
+    <div class="panel">
+      <div class="panel-title">Terrain 3D</div>
+      <div class="terrain-controls">
+        <div class="control-group">
+          <label>Box Width (mi):</label>
+          <input type="number" id="terrainWidth" value="2" min="0.5" max="6" step="0.5">
+        </div>
+        <div class="control-group">
+          <label>Box Height (mi):</label>
+          <input type="number" id="terrainHeight" value="2" min="0.5" max="6" step="0.5">
+        </div>
+        <div class="control-group">
+          <label>Detail:</label>
+          <select id="terrainDetail">
+            <option value="30">Standard (~30 m)</option>
+            <option value="15" selected>High (~15 m)</option>
+            <option value="10">Max (~10 m)</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <label>Color By:</label>
+          <select id="terrainColorBy" onchange="renderTerrain()">
+            <option value="elevation">Elevation</option>
+            <option value="slope" selected>Slope Angle</option>
+            <option value="aspect">Aspect (facing)</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <label>Vertical Scale:</label>
+          <select id="terrainExag" onchange="renderTerrain()">
+            <option value="1" selected>1× (true)</option>
+            <option value="1.5">1.5×</option>
+            <option value="2">2×</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <button class="btn" onclick="loadTerrainForCurrentSite()">Load Terrain</button>
+        </div>
+      </div>
+      <div id="terrainStatusMsg" class="status-msg" style="text-align: left; margin-top: 0;">Ready.</div>
+      <div id="terrainPlot"></div>
+      <div class="section-note">Elevation: AWS Terrain Tiles (USGS 3DEP in the US). Drag to rotate, scroll to zoom, right-drag to pan. Box is centered on the primary SNOTEL site (red marker).</div>
     </div>
   </div>
 
@@ -528,6 +589,7 @@
       status.innerText = `Loaded ${site.name} (${site.id}) — ${count} SNOTEL site${count === 1 ? '' : 's'} within ${radiusMiles} mi.`;
 
       loadSnowpackData(site);
+      loadTerrain(site);
     }
 
     /* =====================================================================
@@ -1091,6 +1153,259 @@
         dataStatus.innerText = `Data fetch failed: ${err.message}`;
         console.error('Powder Dash data fetch error:', err);
       }
+    }
+
+    /* =====================================================================
+       TERRAIN 3D
+       Elevation comes from AWS Terrain Tiles ("Terrarium" PNG encoding:
+       meters = R*256 + G + B/256 - 32768), fetched in the browser and
+       decoded via canvas — no key, CORS-enabled, and global, so this works
+       for any SNOTEL site from its lat/lon alone. In the US the tiles are
+       built from USGS 3DEP (~10 m). We mosaic the zoom-14 tiles covering the
+       box (~7 m/px at these latitudes), then resample onto a regular grid
+       at the chosen Detail spacing and derive slope and aspect from it.
+       ===================================================================== */
+    const TERRAIN_TILE_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
+    const TERRAIN_ZOOM = 14;
+    const TERRAIN_MAX_GRID = 360;          // cap per axis, keeps WebGL snappy
+    const M_PER_MILE = 1609.344;
+    const FT_PER_M = 3.28084;
+    const TERRAIN_CONTOUR_FT = 100;
+
+    let terrainState = null;   // last loaded grid, so Color By / Vertical Scale re-render without refetching
+    let terrainBoxLayer = null;
+    let terrainLoadSeq = 0;
+
+    function lonToTileX(lon, z) { return (lon + 180) / 360 * Math.pow(2, z); }
+    function latToTileY(lat, z) {
+      const r = lat * Math.PI / 180;
+      return (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * Math.pow(2, z);
+    }
+
+    function loadTileImage(z, x, y) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error(`tile ${z}/${x}/${y} failed to load`));
+        img.src = TERRAIN_TILE_URL.replace('{z}', z).replace('{x}', x).replace('{y}', y);
+      });
+    }
+
+    // Fetches every tile covering the lat/lon bbox and returns a sampler
+    // elevAt(lat, lon) -> meters (bilinear in tile-pixel space).
+    async function buildElevationSampler(bbox) {
+      const z = TERRAIN_ZOOM;
+      const x0 = Math.floor(lonToTileX(bbox.west, z)), x1 = Math.floor(lonToTileX(bbox.east, z));
+      const y0 = Math.floor(latToTileY(bbox.north, z)), y1 = Math.floor(latToTileY(bbox.south, z));
+      const nx = x1 - x0 + 1, ny = y1 - y0 + 1;
+      if (nx * ny > 64) throw new Error('box too large');
+
+      const canvas = document.createElement('canvas');
+      canvas.width = nx * 256; canvas.height = ny * 256;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      const jobs = [];
+      for (let ty = y0; ty <= y1; ty++) {
+        for (let tx = x0; tx <= x1; tx++) {
+          jobs.push(loadTileImage(z, tx, ty).then(img => ctx.drawImage(img, (tx - x0) * 256, (ty - y0) * 256)));
+        }
+      }
+      await Promise.all(jobs);
+      const px = ctx.getImageData(0, 0, canvas.width, canvas.height).data;   // throws if CORS blocked
+      const W = canvas.width, H = canvas.height;
+      const elevPx = (ix, iy) => {
+        ix = Math.max(0, Math.min(W - 1, ix)); iy = Math.max(0, Math.min(H - 1, iy));
+        const i = (iy * W + ix) * 4;
+        return px[i] * 256 + px[i + 1] + px[i + 2] / 256 - 32768;
+      };
+      return (lat, lon) => {
+        const fx = (lonToTileX(lon, z) - x0) * 256 - 0.5;
+        const fy = (latToTileY(lat, z) - y0) * 256 - 0.5;
+        const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy;
+        return elevPx(ix, iy) * (1 - tx) * (1 - ty) + elevPx(ix + 1, iy) * tx * (1 - ty) +
+               elevPx(ix, iy + 1) * (1 - tx) * ty + elevPx(ix + 1, iy + 1) * tx * ty;
+      };
+    }
+
+    const ASPECT_NAMES = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    function aspectName(deg) { return ASPECT_NAMES[Math.round(deg / 45) % 8]; }
+
+    function currentPrimarySite() {
+      const id = document.getElementById('siteId').value.trim();
+      return SNOTEL_SITES.find(s => s.id === id);
+    }
+
+    function loadTerrainForCurrentSite() {
+      const site = currentPrimarySite();
+      if (!site) {
+        document.getElementById('terrainStatusMsg').innerText = 'Load a valid primary site first.';
+        return;
+      }
+      loadTerrain(site);
+    }
+
+    async function loadTerrain(site) {
+      const status = document.getElementById('terrainStatusMsg');
+      const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+      const wMi = clamp(parseFloat(document.getElementById('terrainWidth').value) || 2, 0.5, 6);
+      const hMi = clamp(parseFloat(document.getElementById('terrainHeight').value) || 2, 0.5, 6);
+      const spacingTarget = parseFloat(document.getElementById('terrainDetail').value) || 15;
+      const seq = ++terrainLoadSeq;
+
+      const halfW = wMi * M_PER_MILE / 2, halfH = hMi * M_PER_MILE / 2;
+      const mPerDegLat = 111320, mPerDegLon = 111320 * Math.cos(site.lat * Math.PI / 180);
+      const bbox = {
+        south: site.lat - halfH / mPerDegLat, north: site.lat + halfH / mPerDegLat,
+        west: site.lon - halfW / mPerDegLon, east: site.lon + halfW / mPerDegLon
+      };
+
+      if (map) {
+        if (terrainBoxLayer) map.removeLayer(terrainBoxLayer);
+        terrainBoxLayer = L.rectangle([[bbox.south, bbox.west], [bbox.north, bbox.east]], {
+          color: '#d9534f', weight: 1.5, fill: false, dashArray: '4 3', interactive: false
+        }).addTo(map);
+      }
+
+      status.innerText = `Fetching elevation for a ${wMi} × ${hMi} mi box around ${site.name}...`;
+      try {
+        const elevAt = await buildElevationSampler(bbox);
+        if (seq !== terrainLoadSeq) return;   // a newer load started
+
+        const nx = Math.min(TERRAIN_MAX_GRID, Math.round(2 * halfW / spacingTarget) + 1);
+        const ny = Math.min(TERRAIN_MAX_GRID, Math.round(2 * halfH / spacingTarget) + 1);
+        const dx = 2 * halfW / (nx - 1), dy = 2 * halfH / (ny - 1);   // meters
+
+        // Rows run south -> north, columns west -> east.
+        const xMi = [], yMi = [], zM = [];
+        for (let i = 0; i < nx; i++) xMi.push((-halfW + i * dx) / M_PER_MILE);
+        for (let j = 0; j < ny; j++) {
+          yMi.push((-halfH + j * dy) / M_PER_MILE);
+          const lat = bbox.south + (j * dy) / mPerDegLat;
+          const row = [];
+          for (let i = 0; i < nx; i++) row.push(elevAt(lat, bbox.west + (i * dx) / mPerDegLon));
+          zM.push(row);
+        }
+
+        // Slope (deg) and aspect (compass deg the slope faces) by central
+        // differences; edges fall back to one-sided differences.
+        const slope = [], aspect = [];
+        for (let j = 0; j < ny; j++) {
+          const sRow = [], aRow = [];
+          const jn = Math.min(ny - 1, j + 1), js = Math.max(0, j - 1);
+          for (let i = 0; i < nx; i++) {
+            const ie = Math.min(nx - 1, i + 1), iw = Math.max(0, i - 1);
+            const dzdx = (zM[j][ie] - zM[j][iw]) / ((ie - iw) * dx);
+            const dzdy = (zM[jn][i] - zM[js][i]) / ((jn - js) * dy);
+            sRow.push(Math.atan(Math.hypot(dzdx, dzdy)) * 180 / Math.PI);
+            let a = Math.atan2(-dzdx, -dzdy) * 180 / Math.PI;
+            aRow.push(a < 0 ? a + 360 : a);
+          }
+          slope.push(sRow); aspect.push(aRow);
+        }
+
+        const zFt = zM.map(r => r.map(v => v * FT_PER_M));
+        const centerFt = elevAt(site.lat, site.lon) * FT_PER_M;
+        let zMin = Infinity, zMax = -Infinity;
+        zFt.forEach(r => r.forEach(v => { if (v < zMin) zMin = v; if (v > zMax) zMax = v; }));
+
+        terrainState = { site, wMi, hMi, xMi, yMi, zFt, slope, aspect, centerFt, zMin, zMax, spacing: Math.max(dx, dy) };
+        renderTerrain();
+        status.innerText = `${site.name}: ${wMi} × ${hMi} mi, ${nx} × ${ny} grid (~${Math.round(Math.max(dx, dy))} m spacing). ` +
+          `Elevation ${Math.round(zMin).toLocaleString()}–${Math.round(zMax).toLocaleString()} ft; station sits at ~${Math.round(centerFt).toLocaleString()} ft on the model (listed ${site.elevFt.toLocaleString()} ft).`;
+      } catch (err) {
+        if (seq !== terrainLoadSeq) return;
+        status.innerText = `Terrain load failed: ${err.message}`;
+        console.error('Powder Dash terrain error:', err);
+      }
+    }
+
+    // Slope bins follow the usual avalanche-terrain shading (CalTopo-style):
+    // <25° green, 25–30 yellow, 30–35 orange, 35–45 red, 45+ purple.
+    const SLOPE_COLORSCALE = [
+      [0, '#cfe8c4'], [25 / 60, '#7cc36b'],
+      [25 / 60, '#f7e463'], [30 / 60, '#f7e463'],
+      [30 / 60, '#f5a742'], [35 / 60, '#f5a742'],
+      [35 / 60, '#e0453a'], [45 / 60, '#e0453a'],
+      [45 / 60, '#8e44ad'], [1, '#5b2c6f']
+    ];
+    // Cyclic: N blue -> E yellow -> S red -> W green -> N blue.
+    const ASPECT_COLORSCALE = [
+      [0, '#2f6fd6'], [0.125, '#45b0c9'], [0.25, '#f2d24b'], [0.375, '#f29a3d'],
+      [0.5, '#d9453a'], [0.625, '#b25ab8'], [0.75, '#5bb85b'], [0.875, '#3b8f9e'], [1, '#2f6fd6']
+    ];
+    const ELEV_COLORSCALE = [
+      [0, '#4f7942'], [0.3, '#9bbf73'], [0.55, '#d8c99b'], [0.8, '#a88f73'], [1, '#f5f5f5']
+    ];
+
+    function renderTerrain() {
+      const st = terrainState;
+      const plotEl = document.getElementById('terrainPlot');
+      if (!st || typeof Plotly === 'undefined') return;
+
+      const colorBy = document.getElementById('terrainColorBy').value;
+      const exag = parseFloat(document.getElementById('terrainExag').value) || 1;
+
+      let surfacecolor, colorscale, cmin, cmax, colorbar;
+      if (colorBy === 'slope') {
+        surfacecolor = st.slope; colorscale = SLOPE_COLORSCALE; cmin = 0; cmax = 60;
+        colorbar = { title: { text: 'Slope °', side: 'right' }, tickvals: [0, 25, 30, 35, 45, 60] };
+      } else if (colorBy === 'aspect') {
+        surfacecolor = st.aspect; colorscale = ASPECT_COLORSCALE; cmin = 0; cmax = 360;
+        colorbar = { title: { text: 'Faces', side: 'right' }, tickvals: [0, 45, 90, 135, 180, 225, 270, 315, 360], ticktext: ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'N'] };
+      } else {
+        surfacecolor = st.zFt; colorscale = ELEV_COLORSCALE; cmin = st.zMin; cmax = st.zMax;
+        colorbar = { title: { text: 'Elev ft', side: 'right' } };
+      }
+      colorbar = Object.assign({ thickness: 12, len: 0.7, tickfont: { size: 9 } }, colorbar);
+
+      const hover = st.zFt.map((row, j) => row.map((z, i) =>
+        `${Math.round(z).toLocaleString()} ft<br>Slope ${Math.round(st.slope[j][i])}°<br>Faces ${aspectName(st.aspect[j][i])} (${Math.round(st.aspect[j][i])}°)`));
+
+      const contourStart = Math.ceil(st.zMin / TERRAIN_CONTOUR_FT) * TERRAIN_CONTOUR_FT;
+      const surface = {
+        type: 'surface', x: st.xMi, y: st.yMi, z: st.zFt,
+        surfacecolor, colorscale, cmin, cmax, colorbar,
+        customdata: hover,
+        hovertemplate: '%{customdata}<br>%{x:.2f} mi E, %{y:.2f} mi N<extra></extra>',
+        lighting: { ambient: 0.55, diffuse: 0.85, roughness: 0.9, specular: 0.05, fresnel: 0.1 },
+        lightposition: { x: -10000, y: 10000, z: 20000 },
+        contours: {
+          z: { show: true, start: contourStart, end: st.zMax, size: TERRAIN_CONTOUR_FT, color: 'rgba(40,40,40,0.35)', width: 1, usecolormap: false, highlight: false }
+        },
+        showscale: true
+      };
+
+      const marker = {
+        type: 'scatter3d', mode: 'markers+text',
+        x: [0], y: [0], z: [st.centerFt + 25],
+        marker: { size: 5, color: '#ff4d4d', line: { color: '#d9534f', width: 1 } },
+        text: [`${st.site.name} (${st.site.id})`], textposition: 'top center',
+        textfont: { size: 11, color: '#1a252f' },
+        hovertemplate: `${st.site.name} (${st.site.id})<br>${Math.round(st.centerFt).toLocaleString()} ft<extra></extra>`,
+        showlegend: false
+      };
+
+      // True-scale aspect: x/y in miles, z converted ft -> mi, times the
+      // chosen exaggeration, all normalized so the longest side is 1.
+      const zSpanMi = Math.max(1, st.zMax - st.zMin) / 5280 * exag;
+      const longest = Math.max(st.wMi, st.hMi);
+      const aspectratio = { x: st.wMi / longest, y: st.hMi / longest, z: zSpanMi / longest };
+
+      const layout = {
+        margin: { l: 0, r: 0, t: 0, b: 0 },
+        font: { family: 'Arial, sans-serif', size: 10 },
+        paper_bgcolor: 'white',
+        scene: {
+          aspectmode: 'manual', aspectratio,
+          xaxis: { title: { text: 'mi E' }, tickfont: { size: 9 }, backgroundcolor: '#f4f6f8', showbackground: true },
+          yaxis: { title: { text: 'mi N' }, tickfont: { size: 9 }, backgroundcolor: '#f4f6f8', showbackground: true },
+          zaxis: { title: { text: 'ft' }, tickfont: { size: 9 }, backgroundcolor: '#eef1f4', showbackground: true },
+          camera: { eye: { x: -0.9, y: -1.5, z: 0.9 } }
+        },
+        uirevision: `${st.site.id}-${st.wMi}-${st.hMi}`   // keep the user's camera across recolors
+      };
+
+      Plotly.react(plotEl, [surface, marker], layout, { displaylogo: false, responsive: true, modeBarButtonsToRemove: ['toImage'] });
     }
 
     /* =====================================================================
