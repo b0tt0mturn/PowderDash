@@ -356,6 +356,20 @@
             <option value="elevation">Elevation</option>
             <option value="slope" selected>Slope Angle</option>
             <option value="aspect">Aspect (facing)</option>
+            <option value="hillshade">Hillshade (gray)</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <label>Light From:</label>
+          <select id="terrainLightFrom" onchange="renderTerrain()" title="Sun direction for Hillshade">
+            <option value="0">N</option>
+            <option value="45">NE</option>
+            <option value="90">E</option>
+            <option value="135">SE</option>
+            <option value="180">S</option>
+            <option value="225">SW</option>
+            <option value="270">W</option>
+            <option value="315" selected>NW (standard)</option>
           </select>
         </div>
         <div class="control-group">
@@ -1315,19 +1329,20 @@
 
         // Slope (deg) and aspect (compass deg the slope faces) by central
         // differences; edges fall back to one-sided differences.
-        const slope = [], aspect = [];
+        const slope = [], aspect = [], gradX = [], gradY = [];
         for (let j = 0; j < ny; j++) {
-          const sRow = [], aRow = [];
+          const sRow = [], aRow = [], gxRow = [], gyRow = [];
           const jn = Math.min(ny - 1, j + 1), js = Math.max(0, j - 1);
           for (let i = 0; i < nx; i++) {
             const ie = Math.min(nx - 1, i + 1), iw = Math.max(0, i - 1);
             const dzdx = (zM[j][ie] - zM[j][iw]) / ((ie - iw) * dx);
             const dzdy = (zM[jn][i] - zM[js][i]) / ((jn - js) * dy);
+            gxRow.push(dzdx); gyRow.push(dzdy);
             sRow.push(Math.atan(Math.hypot(dzdx, dzdy)) * 180 / Math.PI);
             let a = Math.atan2(-dzdx, -dzdy) * 180 / Math.PI;
             aRow.push(a < 0 ? a + 360 : a);
           }
-          slope.push(sRow); aspect.push(aRow);
+          slope.push(sRow); aspect.push(aRow); gradX.push(gxRow); gradY.push(gyRow);
         }
 
         const zFt = zM.map(r => r.map(v => v * FT_PER_M));
@@ -1335,7 +1350,7 @@
         let zMin = Infinity, zMax = -Infinity;
         zFt.forEach(r => r.forEach(v => { if (v < zMin) zMin = v; if (v > zMax) zMax = v; }));
 
-        terrainState = { site, wMi, hMi, xMi, yMi, zFt, slope, aspect, centerFt, zMin, zMax, spacing: Math.max(dx, dy) };
+        terrainState = { site, wMi, hMi, xMi, yMi, zFt, slope, aspect, gradX, gradY, centerFt, zMin, zMax, spacing: Math.max(dx, dy) };
         renderTerrain();
         status.innerText = `${site.name}: ${wMi} × ${hMi} mi, ${nx} × ${ny} grid (~${Math.round(Math.max(dx, dy))} m spacing). ` +
           `Elevation ${Math.round(zMin).toLocaleString()}–${Math.round(zMax).toLocaleString()} ft; station sits at ~${Math.round(centerFt).toLocaleString()} ft on the model (listed ${site.elevFt.toLocaleString()} ft).`;
@@ -1364,6 +1379,26 @@
       [0, '#4f7942'], [0.3, '#9bbf73'], [0.55, '#d8c99b'], [0.8, '#a88f73'], [1, '#f5f5f5']
     ];
 
+    // Classic cartographic hillshade: brightness = cos of the angle between
+    // the surface normal and a sun at HILLSHADE_ALTITUDE above the horizon
+    // from the chosen azimuth (NW is the convention — it reads as "lit from
+    // the upper left", which the eye interprets as relief rather than
+    // inverted). Gradients are scaled by the vertical exaggeration so the
+    // shading matches the shape on screen.
+    const HILLSHADE_ALTITUDE = 40;
+    function computeHillshade(st, azimuthDeg, exag) {
+      const zen = (90 - HILLSHADE_ALTITUDE) * Math.PI / 180;
+      const az = azimuthDeg * Math.PI / 180;
+      // Unit vector toward the sun (east, north, up).
+      const sx = Math.sin(zen) * Math.sin(az), sy = Math.sin(zen) * Math.cos(az), sz = Math.cos(zen);
+      return st.gradX.map((row, j) => row.map((gx, i) => {
+        const nx = -gx * exag, ny = -st.gradY[j][i] * exag;   // normal = (-dz/dx, -dz/dy, 1)
+        const len = Math.sqrt(nx * nx + ny * ny + 1);
+        return Math.max(0, (nx * sx + ny * sy + sz) / len);
+      }));
+    }
+    const HILLSHADE_COLORSCALE = [[0, '#1e1e1e'], [0.5, '#8c8c8c'], [1, '#f7f7f7']];
+
     function renderTerrain() {
       const st = terrainState;
       const plotEl = document.getElementById('terrainPlot');
@@ -1379,11 +1414,17 @@
       } else if (colorBy === 'aspect') {
         surfacecolor = st.aspect; colorscale = ASPECT_COLORSCALE; cmin = 0; cmax = 360;
         colorbar = { title: { text: 'Faces', side: 'right' }, tickvals: [0, 45, 90, 135, 180, 225, 270, 315, 360], ticktext: ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'N'] };
+      } else if (colorBy === 'hillshade') {
+        const az = parseFloat(document.getElementById('terrainLightFrom').value);
+        surfacecolor = computeHillshade(st, isNaN(az) ? 315 : az, exag);
+        colorscale = HILLSHADE_COLORSCALE; cmin = 0; cmax = 1;
       } else {
         surfacecolor = st.zFt; colorscale = ELEV_COLORSCALE; cmin = st.zMin; cmax = st.zMax;
         colorbar = { title: { text: 'Elev ft', side: 'right' } };
       }
-      colorbar = Object.assign({ thickness: 12, len: 0.7, tickfont: { size: 9 } }, colorbar);
+      colorbar = Object.assign({ thickness: 12, len: 0.7, tickfont: { size: 9 } }, colorbar || {});
+      const isShade = colorBy === 'hillshade';
+      document.getElementById('terrainLightFrom').disabled = !isShade;
 
       const hover = st.zFt.map((row, j) => row.map((z, i) =>
         `${Math.round(z).toLocaleString()} ft<br>Slope ${Math.round(st.slope[j][i])}°<br>Faces ${aspectName(st.aspect[j][i])} (${Math.round(st.aspect[j][i])}°)`));
@@ -1394,12 +1435,16 @@
         surfacecolor, colorscale, cmin, cmax, colorbar,
         customdata: hover,
         hovertemplate: '%{customdata}<br>%{x:.2f} mi E, %{y:.2f} mi N<extra></extra>',
-        lighting: { ambient: 0.55, diffuse: 0.85, roughness: 0.9, specular: 0.05, fresnel: 0.1 },
+        // Hillshade already bakes in the lighting, so turn Plotly's own
+        // (camera-relative) shading off for it to avoid double shading.
+        lighting: isShade
+          ? { ambient: 1, diffuse: 0, specular: 0, roughness: 1, fresnel: 0 }
+          : { ambient: 0.55, diffuse: 0.85, roughness: 0.9, specular: 0.05, fresnel: 0.1 },
         lightposition: { x: -10000, y: 10000, z: 20000 },
         contours: {
-          z: { show: true, start: contourStart, end: st.zMax, size: TERRAIN_CONTOUR_FT, color: 'rgba(40,40,40,0.35)', width: 1, usecolormap: false, highlight: false }
+          z: { show: true, start: contourStart, end: st.zMax, size: TERRAIN_CONTOUR_FT, color: isShade ? 'rgba(120,70,20,0.35)' : 'rgba(40,40,40,0.35)', width: 1, usecolormap: false, highlight: false }
         },
-        showscale: true
+        showscale: !isShade
       };
 
       const marker = {
