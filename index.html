@@ -672,6 +672,139 @@
       };
     }
 
+    /* ---------------------------------------------------------------------
+       Median SWE overlay (primary site only)
+       NRCS publishes an official daily median SWE (1991-2020 normals) via
+       centralTendencyType=MEDIAN on DAILY data — not on HOURLY, and not for
+       sites whose record is too short to have a normal (e.g. Powder
+       Mountain 1300, which starts in 2021). For those, we fall back to a
+       median computed from the site's own prior seasons: for each day in
+       the window, the median of that calendar day's daily SWE across every
+       earlier year the site has data for. Requires MEDIAN_MIN_SEASONS years
+       so a single season can't masquerade as a "median".
+       --------------------------------------------------------------------- */
+    const MEDIAN_MIN_SEASONS = 3;
+    const MEDIAN_LINE_COLOR = '#5a6b7b';
+
+    function awdbDailySweUrl(site, beginDate, endDate, withMedian) {
+      const triplet = `${site.id}:${site.state}:SNTL`;
+      return `${AWDB_DATA_URL}?stationTriplets=${encodeURIComponent(triplet)}&elements=WTEQ&duration=DAILY&beginDate=${beginDate}&endDate=${endDate}` +
+        (withMedian ? '&centralTendencyType=MEDIAN' : '');
+    }
+
+    async function fetchDailySwe(site, beginDate, endDate, withMedian) {
+      const resp = await fetch(awdbDailySweUrl(site, beginDate, endDate, withMedian));
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const json = await resp.json();
+      return (json.length && json[0].data && json[0].data[0]) ? json[0].data[0] : null;
+    }
+
+    // Same calendar day k years earlier; Feb 29 maps to Feb 28.
+    function shiftYears(dateStr, k) {
+      const y = parseInt(dateStr.slice(0, 4)) - k;
+      let md = dateStr.slice(5, 10);
+      if (md === '02-29') md = '02-28';
+      return `${y}-${md}`;
+    }
+
+    function medianOf(nums) {
+      const a = nums.slice().sort((p, q) => p - q);
+      const m = Math.floor(a.length / 2);
+      return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+    }
+
+    // dailyValues: [{date:'YYYY-MM-DD', value}], full period of record.
+    // windowDates: the days to compute a median for. Only years strictly
+    // before each target date count (never the season being analyzed).
+    function computeSiteMedian(dailyValues, windowDates) {
+      const byDate = new Map();
+      dailyValues.forEach(v => { if (v.value != null) byDate.set(v.date.slice(0, 10), v.value); });
+      const firstYear = dailyValues.length ? parseInt(dailyValues[0].date.slice(0, 4)) : 0;
+      const points = [];
+      let minN = Infinity, maxN = 0;
+      windowDates.forEach(d => {
+        const samples = [];
+        for (let k = 1; parseInt(d.slice(0, 4)) - k >= firstYear; k++) {
+          const v = byDate.get(shiftYears(d, k));
+          if (v != null) samples.push(v);
+        }
+        if (samples.length >= MEDIAN_MIN_SEASONS) {
+          points.push({ date: d, median: Math.round(medianOf(samples) * 10) / 10 });
+          minN = Math.min(minN, samples.length);
+          maxN = Math.max(maxN, samples.length);
+        }
+      });
+      return { points, minN: points.length ? minN : 0, maxN };
+    }
+
+    function listDates(beginDate, endDate) {
+      const out = [];
+      for (let d = beginDate; d <= endDate; d = addDaysUTC(d, 1)) out.push(d);
+      return out;
+    }
+
+    // Returns { source: 'official'|'computed', points:[{date, median}],
+    // label, detail, peak? } or { source: 'none', detail }.
+    async function fetchSweMedian(site, beginDate, endDateStr) {
+      const windowEntry = await fetchDailySwe(site, beginDate, endDateStr, true);
+      if (!windowEntry) return { source: 'none', detail: 'no daily SWE record for this site' };
+
+      const official = (windowEntry.values || []).filter(v => v.median != null);
+      if (official.length) {
+        const tc = windowEntry.timingCentralTendencies || {};
+        return {
+          source: 'official',
+          points: official.map(v => ({ date: v.date.slice(0, 10), median: v.median })),
+          label: 'Median (NRCS 1991–2020)',
+          detail: 'Median: official NRCS 1991–2020 normal.',
+          peak: tc.medianPeak || null
+        };
+      }
+
+      // No official normal — compute one from the site's own prior seasons.
+      const porBegin = (windowEntry.stationElement.beginDate || '').slice(0, 10);
+      if (!porBegin) return { source: 'none', detail: 'no period-of-record start reported' };
+      const porEntry = await fetchDailySwe(site, porBegin, endDateStr, false);
+      const res = computeSiteMedian((porEntry && porEntry.values) || [], listDates(beginDate, endDateStr));
+      if (!res.points.length) {
+        return { source: 'none', detail: `no NRCS median, and fewer than ${MEDIAN_MIN_SEASONS} prior seasons of data (record starts ${porBegin})` };
+      }
+      const n = res.minN === res.maxN ? `${res.minN}` : `${res.minN}–${res.maxN}`;
+      return {
+        source: 'computed',
+        points: res.points,
+        label: `Median (computed, ${n} seasons)`,
+        detail: `Median: computed from this site's ${n} prior seasons (record starts ${porBegin.slice(0, 4)}) — NRCS has no official median for a record this short, so treat it as rough.`
+      };
+    }
+
+    // "Latest SWE X in = Y% of median (Z in)" for the panel note, using the
+    // last hourly SWE reading and the median for that reading's day.
+    function sweMedianNote(medianInfo, sweValues) {
+      if (!medianInfo || medianInfo.source === 'none') {
+        return medianInfo ? `No median shown: ${medianInfo.detail}.` : '';
+      }
+      const parts = [];
+      const last = sweValues && sweValues.length ? sweValues[sweValues.length - 1] : null;
+      if (last) {
+        const day = last.date.slice(0, 10);
+        const m = medianInfo.points.find(p => p.date === day) || medianInfo.points[medianInfo.points.length - 1];
+        if (m) {
+          const mdLabel = new Date(m.date + 'T00:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+          parts.push(m.median > 0
+            ? `Latest SWE ${last.value} in = ${Math.round(last.value / m.median * 100)}% of median (${m.median} in for ${mdLabel}).`
+            : `Latest SWE ${last.value} in; median for ${mdLabel} is 0 in (normally snow-free).`);
+        }
+      }
+      parts.push(medianInfo.detail);
+      if (medianInfo.peak) {
+        const pk = new Date(Date.UTC(2000, medianInfo.peak.month - 1, medianInfo.peak.day))
+          .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+        parts.push(`Median peak ${medianInfo.peak.value} in on ${pk}.`);
+      }
+      return parts.join(' ');
+    }
+
     // Legend items with a comp site's name ("Ben Lomond Peak (332)") run much
     // wider than the short primary-series labels ("SWE", "Max", "Primary
     // site") — used below to estimate how many legend items fit per row.
@@ -767,7 +900,7 @@
       };
     }
 
-    function renderDataPanels(dataArr, compsData, resolvedComps, endDateStr) {
+    function renderDataPanels(dataArr, compsData, resolvedComps, endDateStr, medianInfo) {
       const container = document.getElementById('dataPanels');
       container.innerHTML = '';
       const endBound = endDateStr + ' 23:59';
@@ -848,10 +981,26 @@
               });
             }
           });
+          let note = group.note;
+          if (group.compCode === 'WTEQ' && medianInfo) {
+            if (medianInfo.source !== 'none' && medianInfo.points.length) {
+              traces.push({
+                x: medianInfo.points.map(p => p.date + ' 00:00'),
+                y: medianInfo.points.map(p => p.median),
+                type: 'scatter', mode: medianInfo.points.length < 3 ? 'lines+markers' : 'lines',
+                name: medianInfo.label,
+                line: { color: MEDIAN_LINE_COLOR, width: 1.8, dash: 'dash' },
+                marker: { size: 4, color: MEDIAN_LINE_COLOR },
+                hovertemplate: `${medianInfo.label}<br>%{x|%b %d}<br>%{y} in<extra></extra>`
+              });
+            }
+            const sweSeries = byCode.WTEQ && byCode.WTEQ[0] && byCode.WTEQ[0].values;
+            note = sweMedianNote(medianInfo, sweSeries);
+          }
           if (group.compCode) traces.push(...compTracesFor(group.compCode));
           if (traces.length) {
             panelCount++;
-            addDataPanel(container, `dp-${panelCount}`, group.title, group.note, group.tall, traces, group.unit, traces.length > 1);
+            addDataPanel(container, `dp-${panelCount}`, group.title, note, group.tall, traces, group.unit, traces.length > 1);
           }
         } else if (group.depthElement) {
           const series = (byCode[group.depthElement] || []).filter(s => s.values.length);
@@ -899,9 +1048,14 @@
       dataStatus.innerText = `Fetching hourly data for ${site.name}${resolvedComps.length ? ` + ${resolvedComps.length} comp site(s)` : ''} (${beginDate} to ${endDateStr})...`;
 
       try {
-        const [primaryData, compResults] = await Promise.all([
+        const [primaryData, compResults, medianInfo] = await Promise.all([
           fetchSiteData(site, ELEMENTS_QUERY, beginDate, endDateQuery),
-          Promise.allSettled(resolvedComps.map(s => fetchSiteData(s, COMP_ELEMENTS_QUERY, beginDate, endDateQuery)))
+          Promise.allSettled(resolvedComps.map(s => fetchSiteData(s, COMP_ELEMENTS_QUERY, beginDate, endDateQuery))),
+          // Never fatal: a failed median fetch just means no median line.
+          fetchSweMedian(site, beginDate, endDateStr).catch(err => {
+            console.error('Powder Dash median fetch error:', err);
+            return { source: 'none', detail: `median fetch failed (${err.message})` };
+          })
         ]);
 
         if (!primaryData.length) {
@@ -923,7 +1077,7 @@
           compsData[s.id] = byCode;
         });
 
-        const panelCount = renderDataPanels(primaryData, compsData, resolvedComps, endDateStr);
+        const panelCount = renderDataPanels(primaryData, compsData, resolvedComps, endDateStr, medianInfo);
 
         const notes = [];
         if (unknownComps.length) notes.push(`comp ID${unknownComps.length === 1 ? '' : 's'} not in local dataset: ${unknownComps.join(', ')}`);
