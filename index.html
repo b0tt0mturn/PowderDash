@@ -543,7 +543,7 @@
     const DEPTH_PALETTE = ['#2f80ed', '#d9534f', '#28a745', '#f0a500', '#8e44ad', '#17a2b8'];
 
     // The one color for every primary-site line that plots a single
-    // quantity (SWE, Snow Depth, Precip, Wind Direction, Battery, the two
+    // quantity (SWE, Snow Depth, Precip, Wind Direction, the two
     // delta panels), so the primary site reads consistently across panels.
     // Panels with more than one genuinely distinct series (Air Temp,
     // Humidity, Wind Speed/Gust, Radiation) keep their own distinguishing
@@ -570,7 +570,7 @@
     // Display groups, in panel order. `elements` = one or more fixed named
     // series sharing a panel (e.g. avg/max wind speed). `depthElement` = a
     // single element code whose sensors span multiple heightDepths (soil
-    // moisture/temp, the snowpack temperature profile, etc.) — every depth
+    // temp, the snowpack temperature profile, etc.) — every depth
     // the site reports gets its own line, discovered at fetch time rather
     // than hardcoded, so this generalizes across sites in the suite.
     // `compCode`, when present, overlays each Comps site's series for that
@@ -598,7 +598,6 @@
           { code: 'WSPDX', name: 'Max', color: '#d9534f' }
         ] },
       { title: 'Wind Direction', unit: '° from N', elements: [{ code: 'WDIRV', name: 'Dir', color: PRIMARY_BLUE }] },
-      { title: 'Soil Moisture', unit: '%', depthElement: 'SMS' },
       { title: 'Soil Temperature', unit: '°F', depthElement: 'STO' },
       { title: 'Snowpack / Above-Snow Temperature Profile', unit: '°F', depthElement: 'PTEMP', gradient: true, tall: true,
         note: 'One sensor per heightDepth (inches; negative = below ground, 0 = surface). Depths above the current snow surface track air temperature; depths within the pack are insulated and smoother.' },
@@ -609,13 +608,7 @@
       { title: 'Longwave Radiation', unit: 'W/m²', elements: [
           { code: 'LWINV', name: 'Incoming', color: PRIMARY_BLUE },
           { code: 'LWOTV', name: 'Outgoing', color: '#f0a500' }
-        ] },
-      { title: 'Soil Sensor — RDC (raw, unitless)', unit: '', depthElement: 'RDC',
-        note: 'Raw resistive/dielectric divider readout underlying the soil-moisture calibration — diagnostic, included when the site reports it.' },
-      { title: 'Soil Sensor — SAL', unit: 'g/L', depthElement: 'SAL',
-        note: 'Soil solution salinity/conductivity channel — diagnostic, included when the site reports it.' },
-      { title: 'Station Battery Voltage', unit: 'V', elements: [{ code: 'BATT', name: 'Battery', color: PRIMARY_BLUE }],
-        note: 'Not snowpack data, but included since it’s in the hourly set.' }
+        ] }
     ];
 
     // "New snow" panels: net change since the start of the analysis window
