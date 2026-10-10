@@ -336,11 +336,11 @@
       <div class="terrain-controls">
         <div class="control-group">
           <label>Box Width (mi):</label>
-          <input type="number" id="terrainWidth" value="2" min="0.5" max="6" step="0.5">
+          <input type="number" id="terrainWidth" value="4" min="0.5" max="6" step="0.5">
         </div>
         <div class="control-group">
           <label>Box Height (mi):</label>
-          <input type="number" id="terrainHeight" value="2" min="0.5" max="6" step="0.5">
+          <input type="number" id="terrainHeight" value="3" min="0.5" max="6" step="0.5">
         </div>
         <div class="control-group">
           <label>Detail:</label>
@@ -1294,8 +1294,8 @@
     async function loadTerrain(site) {
       const status = document.getElementById('terrainStatusMsg');
       const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-      const wMi = clamp(parseFloat(document.getElementById('terrainWidth').value) || 2, 0.5, 6);
-      const hMi = clamp(parseFloat(document.getElementById('terrainHeight').value) || 2, 0.5, 6);
+      const wMi = clamp(parseFloat(document.getElementById('terrainWidth').value) || 4, 0.5, 6);
+      const hMi = clamp(parseFloat(document.getElementById('terrainHeight').value) || 3, 0.5, 6);
       const spacingTarget = parseFloat(document.getElementById('terrainDetail').value) || 15;
       const seq = ++terrainLoadSeq;
 
@@ -1587,7 +1587,9 @@
           xaxis: { title: { text: 'mi E' }, tickfont: { size: 9 }, backgroundcolor: '#f4f6f8', showbackground: true },
           yaxis: { title: { text: 'mi N' }, tickfont: { size: 9 }, backgroundcolor: '#f4f6f8', showbackground: true },
           zaxis: { title: { text: 'ft' }, tickfont: { size: 9 }, backgroundcolor: '#eef1f4', showbackground: true },
-          camera: { eye: { x: -0.75, y: -1.25, z: 0.75 } }
+          // Default view: from due north looking south (not from a corner),
+          // tilted down enough to read the terrain.
+          camera: { eye: { x: 0, y: 1.35, z: 0.75 }, center: { x: 0, y: 0, z: -0.1 }, up: { x: 0, y: 0, z: 1 } }
         },
         uirevision: `${st.site.id}-${st.wMi}-${st.hMi}`   // keep the user's camera across recolors
       };
