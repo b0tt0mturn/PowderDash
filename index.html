@@ -22,6 +22,14 @@
 
   Versioning: MAJOR.MINOR.PATCH, same convention as Wave Dash. Bumped only at
   explicit "ready to push" points.
+    v0.4.1 (2026-10-11) — Terrain 3D fixes: aspect colors flipped so East
+      is green and West is yellow (N blue / S red unchanged, intermediate
+      directions mirrored to match). Lift lines made reliable: Powder
+      Mountain (1300) lifts are now bundled into the file (OSM snapshot,
+      15 lifts within 3.5 mi) so that site never hits the Overpass server;
+      other sites fetch live with retry/backoff, a mirror fallback, and a
+      30-day per-site cache (Overpass replies 429/504 without CORS headers
+      when busy, which Chrome reports as a CORS block).
     v0.4.0 (2026-10-09) — Terrain 3D + median SWE. New Terrain 3D panel: a
       rotatable Plotly surface of the terrain in a box centered on the primary
       site (default 4 x 3 mi, width/height configurable 0.5-6 mi, detail
@@ -424,7 +432,7 @@
     /* =====================================================================
        CONFIGURATION & CONSTANTS
        ===================================================================== */
-    const APP_VERSION = "0.4.0";
+    const APP_VERSION = "0.4.1";
     document.getElementById('appVersionLabel').innerText = `v${APP_VERSION}`;
 
     const EARTH_RADIUS_MILES = 3958.8;
