@@ -22,6 +22,11 @@
 
   Versioning: MAJOR.MINOR.PATCH, same convention as Wave Dash. Bumped only at
   explicit "ready to push" points.
+    v0.6.0 (2026-11-14) — Radar panel: IEM NEXRAD base reflectivity (last hour,
+      5-min frames) and HRRR simulated reflectivity (next 6 h), with a Radar | HRRR
+      switch, player controls, time slider, dBZ legend and status line. The map
+      recentres on the primary SNOTEL site whenever a site is loaded, with a red
+      marker on it. Radar is national, so changing sites never reloads frames.
     v0.5.0 (2026-10-14) — Usage tracking via Cloudflare Web Analytics
       (free, cookieless, no consent banner). Loads only on the published
       site, never from a local file or localhost. Open the site with
@@ -504,7 +509,7 @@
     /* =====================================================================
        CONFIGURATION & CONSTANTS
        ===================================================================== */
-    const APP_VERSION = "0.5.0";
+    const APP_VERSION = "0.6.0";
     document.getElementById('appVersionLabel').innerText = `v${APP_VERSION}`;
 
     const EARTH_RADIUS_MILES = 3958.8;
