@@ -287,6 +287,26 @@
     }
     .plot-box.tall { height: 320px; }
 
+    /* Radar panel (IEM NEXRAD / HRRR tiles, centred on the primary SNOTEL site) */
+    .radar-mode { display: flex; margin-bottom: 8px; border: 1px solid #ced4da; border-radius: 6px; overflow: hidden; }
+    .radar-mode button { flex: 1; padding: 6px 4px; font-size: 12px; font-weight: bold; cursor: pointer; background: #f8f9fa; color: #495057; border: none; border-left: 1px solid #ced4da; }
+    .radar-mode button:first-child { border-left: none; }
+    .radar-mode button:hover { background: #e9ecef; }
+    .radar-mode button.active { background: #1a252f; color: #fff; }
+    .radar-mode button small { display: block; font-weight: normal; font-size: 10px; opacity: 0.8; }
+    .radar-player { display: flex; gap: 4px; margin-bottom: 6px; }
+    .radar-btn { flex: 1; padding: 6px 4px; font-weight: bold; font-size: 12px; cursor: pointer; background: #e9ecef; border: 1px solid #ced4da; border-radius: 4px; }
+    .radar-btn:hover { background: #dee2e6; }
+    .radar-slider { display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px; }
+    .radar-slider input { width: 100%; }
+    .radar-time { font-weight: bold; font-size: 13px; text-align: center; font-variant-numeric: tabular-nums; }
+    #radarMap { height: 420px; width: 100%; border-radius: 6px; }
+    .radar-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 11px; color: #495057; margin-top: 6px; }
+    .radar-legend .sw { display: inline-flex; align-items: center; gap: 3px; }
+    .radar-legend .sw i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; opacity: 0.85; }
+    .radar-legend .note { margin-left: auto; font-style: italic; }
+    @media (max-width: 600px) { #radarMap { height: 320px; } }
+
     /* Terrain 3D panel */
     .terrain-controls {
       display: grid;
@@ -378,6 +398,30 @@
         </div>
 
       </div>
+    </div>
+  </div>
+
+  <div class="grid-container">
+    <div class="panel">
+      <div class="panel-title">Radar</div>
+      <div class="radar-mode" role="group" aria-label="Radar mode">
+        <button data-mode="radar" class="active" onclick="radarSetMode('radar')">Radar<small>last hour</small></button>
+        <button data-mode="hrrr" onclick="radarSetMode('hrrr')">HRRR<small>next 6 h</small></button>
+      </div>
+      <div class="radar-player">
+        <button class="radar-btn" onclick="radarFirst()">First</button>
+        <button class="radar-btn" onclick="radarStep(-1)">Rev</button>
+        <button class="radar-btn" id="radarPlayBtn" onclick="radarTogglePlay()">Play</button>
+        <button class="radar-btn" onclick="radarStep(1)">Next</button>
+        <button class="radar-btn" onclick="radarLast()">Last</button>
+      </div>
+      <div class="radar-slider">
+        <span id="radarTime" class="radar-time">-</span>
+        <input type="range" id="radarSlider" min="0" max="0" value="0" oninput="radarPause(); radarGoTo(parseInt(this.value))">
+      </div>
+      <div id="radarMap"></div>
+      <div class="radar-legend" id="radarLegend"></div>
+      <div id="radarStatusMsg" class="status-msg" style="text-align: left; margin-top: 4px;">Waiting for map...</div>
     </div>
   </div>
 
@@ -657,6 +701,7 @@
 
       document.getElementById('siteName').value = site.name;
       const count = renderSitesOnMap(site, radiusMiles);
+      radarCenter(site);
       status.innerText = `Loaded ${site.name} (${site.id}) — ${count} SNOTEL site${count === 1 ? '' : 's'} within ${radiusMiles} mi.`;
 
       loadSnowpackData(site);
@@ -1732,8 +1777,299 @@
     }
 
     /* =====================================================================
+       RADAR (IEM map tiles: NEXRAD base reflectivity, last hour; HRRR simulated
+       reflectivity, next 6 h). Radar is national, so changing the primary site
+       never reloads frames - radarCenter() only recentres the map on the site.
+       Adapted from Wind Dash's RADAR MODES (v1.12.0).
+       ===================================================================== */
+    const RADAR = {
+      tileUrl: 'https://{s}.agron.iastate.edu/{path}/tile.py/1.0.0/{layer}/{z}/{x}/{y}.png',
+      subdomains: ['mesonet1', 'mesonet2', 'mesonet3', 'mesonet'],   // IEM's DNS aliases, for parallel tile loads
+      attribution: 'Radar: NEXRAD mosaic + HRRR via <a href="https://mesonet.agron.iastate.edu/" target="_blank">IEM</a>',
+      proxyUrl: 'https://noaa-wave-proxy.rwnster.workers.dev',       // fallback for IEM's JSON if the browser can't reach it
+      zoom: 8,
+      opacity: 0.7,
+      layerCacheMax: 30,     // Leaflet tile layers kept around for re-use
+      prefetch: 2,           // frames ahead loaded (invisibly) so playback doesn't stall
+      loopDwell: 4,          // radar loop holds on its latest frame for this many extra ticks
+      nexrad: {              // observed: national base-reflectivity mosaic, every 5 min
+        metaUrl: 'https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.json',
+        layer: t => `ridge::USCOMP-N0Q-${radarStamp(t)}`, path: 'c',
+        frames: 13, stepMin: 5,      // 13 x 5 min = the last hour
+        frameMs: 400, refreshMin: 5
+      },
+      hrrr: {                // forecast: HRRR simulated reflectivity, 15-min steps off hourly runs
+        metaUrl: 'https://mesonet.agron.iastate.edu/data/gis/images/4326/hrrr/refd_1080.json',
+        layer: (init, min) => `hrrr::REFD-F${String(min).padStart(4, '0')}-${radarStamp(init)}`, path: 'cache',
+        stepMin: 15, maxMin: 1080,
+        aheadMin: 360,         // show from now to +6 h
+        frameMs: 300, refreshMin: 20
+      },
+      // NWS-style reflectivity scale for the legend (IEM's ramps are close to this)
+      dbzColors: [[5, '#04e9e7'], [10, '#019ff4'], [15, '#0300f4'], [20, '#02fd02'], [25, '#01c501'], [30, '#008e00'],
+                  [35, '#fdf802'], [40, '#e5bc00'], [45, '#fd9500'], [50, '#fd0000'], [55, '#d40000'], [60, '#bc0000'],
+                  [65, '#f800fd'], [70, '#9854c6']]
+    };
+
+    const radar = {
+      map: null,
+      siteMarker: null,
+      mode: 'radar',       // 'radar' | 'hrrr'
+      product: null,       // what frames[] currently holds
+      frames: [],          // [{ t: utcMs, layer: IEM layer name }]
+      frameIdx: 0,
+      layers: new Map(),   // IEM layer name -> L.tileLayer (oldest first, capped at layerCacheMax)
+      want: null,          // layer name the player is trying to show
+      meta: { radar: null, hrrr: null },   // { t, checkedAt, estimated }
+      loading: false,
+      playTimer: null,
+      refreshTimer: null
+    };
+
+    // UTC YYYYMMDDHHMI, as IEM names its layers.
+    function radarStamp(ms) {
+      const d = new Date(ms), p = n => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}`;
+    }
+
+    function radarInitMap(site) {
+      if (typeof L === 'undefined' || !site) return null;
+      const m = L.map('radarMap', { zoomSnap: 0.5 }).setView([site.lat, site.lon], RADAR.zoom);
+      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
+        attribution: 'Tiles &copy; Esri', maxZoom: 10
+      }).addTo(m);
+      m.createPane('radarPane').style.zIndex = 350;   // above the base map, below the site marker
+      m.getPane('radarPane').style.pointerEvents = 'none';
+      return m;
+    }
+
+    // Recentres the radar on the primary site and marks it. Called from loadSite(), so it
+    // follows whatever site is primary, including ones picked on the map.
+    function radarCenter(site) {
+      if (!radar.map || !site) return;
+      if (!radar.siteMarker) {
+        radar.siteMarker = L.circleMarker([site.lat, site.lon], {
+          radius: 7, color: '#d9534f', fillColor: '#ff4d4d', fillOpacity: 0.9, weight: 2, interactive: false
+        }).addTo(radar.map);
+      } else {
+        radar.siteMarker.setLatLng([site.lat, site.lon]);
+      }
+      radar.map.setView([site.lat, site.lon], radar.map.getZoom());
+    }
+
+    async function radarFetchJson(url) {
+      try {
+        const r = await fetch(url, { cache: 'no-store' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return await r.json();
+      } catch (e) {   // no CORS / network trouble: try the worker proxy
+        const r = await fetch(`${RADAR.proxyUrl}?url=${encodeURIComponent(url)}`, { cache: 'no-store' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return await r.json();
+      }
+    }
+
+    // Newest radar time or HRRR init, re-checked when older than refreshMin.
+    async function radarLoadMeta(product, force = false) {
+      const spec = product === 'radar' ? RADAR.nexrad : RADAR.hrrr;
+      const m = radar.meta[product];
+      if (!force && m && Date.now() - m.checkedAt < spec.refreshMin * 60000) return m;
+      let t = null;
+      try {
+        const j = await radarFetchJson(spec.metaUrl);
+        t = Date.parse(product === 'radar' ? j.meta.valid : j.model_init_utc);
+      } catch (e) {
+        console.warn('Radar meta unavailable:', e);
+      }
+      const estimated = !isFinite(t);
+      if (estimated) {   // radar ~10 min behind (5-min steps); HRRR run ~2 h behind (hourly)
+        const step = product === 'radar' ? 5 * 60000 : 3600000, lag = product === 'radar' ? 10 * 60000 : 2 * 3600000;
+        t = Math.floor((Date.now() - lag) / step) * step;
+      }
+      return (radar.meta[product] = { t, checkedAt: Date.now(), estimated });
+    }
+
+    function radarBuildFrames(product) {
+      const m = radar.meta[product], out = [];
+      if (product === 'radar') {
+        const S = RADAR.nexrad;
+        for (let k = S.frames - 1; k >= 0; k--) { const t = m.t - k * S.stepMin * 60000; out.push({ t, layer: S.layer(t) }); }
+      } else {
+        const S = RADAR.hrrr, from = Date.now() - S.stepMin * 30000;   // first frame: nearest now
+        for (let min = 0; min <= S.maxMin; min += S.stepMin) {
+          const t = m.t + min * 60000;
+          if (t >= from && t <= Date.now() + S.aheadMin * 60000) out.push({ t, layer: S.layer(m.t, min) });
+        }
+      }
+      return out;
+    }
+
+    function radarLayer(name) {
+      let lyr = radar.layers.get(name);
+      if (lyr) { radar.layers.delete(name); radar.layers.set(name, lyr); return lyr; }   // most recent last
+      const path = name.startsWith('hrrr::') ? RADAR.hrrr.path : RADAR.nexrad.path;
+      lyr = L.tileLayer(RADAR.tileUrl.replace('{path}', path).replace('{layer}', name), {
+        pane: 'radarPane', subdomains: RADAR.subdomains, opacity: 0, maxZoom: 10,
+        attribution: RADAR.attribution, keepBuffer: 1
+      });
+      radar.layers.set(name, lyr);
+      // Drop the oldest unused layers past the cap.
+      for (const [k, l] of radar.layers) {
+        if (radar.layers.size <= RADAR.layerCacheMax) break;
+        if (!radar.map.hasLayer(l)) radar.layers.delete(k);
+      }
+      return lyr;
+    }
+
+    // Show frame idx: add its layer (and prefetch the next few), and swap it in once loaded.
+    function radarGoTo(idx) {
+      if (!radar.map || !radar.frames.length) return;
+      radar.frameIdx = Math.max(0, Math.min(radar.frames.length - 1, idx));
+      document.getElementById('radarSlider').value = radar.frameIdx;
+      const f = radar.frames[radar.frameIdx];
+      document.getElementById('radarTime').innerText = radarFmtFrameTime(f.t);
+      const keep = new Set([f.layer]);
+      for (let k = 1; k <= RADAR.prefetch; k++) {
+        const nf = radar.frames[(radar.frameIdx + k) % radar.frames.length];
+        keep.add(nf.layer);
+        const nl = radarLayer(nf.layer);
+        if (!radar.map.hasLayer(nl)) nl.addTo(radar.map);
+      }
+      const lyr = radarLayer(f.layer);
+      if (!radar.map.hasLayer(lyr)) lyr.addTo(radar.map);
+      radar.want = f.layer;
+      const swap = () => {
+        if (radar.want !== f.layer) return;
+        lyr.setOpacity(RADAR.opacity);
+        for (const [k, l] of radar.layers) {
+          if (k === f.layer || !radar.map.hasLayer(l)) continue;
+          if (keep.has(k)) l.setOpacity(0); else radar.map.removeLayer(l);
+        }
+      };
+      if (lyr.isLoading()) lyr.once('load', swap); else swap();
+    }
+
+    function radarClear() {
+      radar.want = null;
+      if (!radar.map) return;
+      for (const l of radar.layers.values()) if (radar.map.hasLayer(l)) radar.map.removeLayer(l);
+    }
+
+    // Load (or refresh) the frames for the current mode and show them. A fresh switch starts at
+    // the latest radar frame / at now for HRRR; a refresh keeps the frame time where it can.
+    async function radarActivate(product, refresh = false) {
+      if (!radar.map) return;
+      radar.loading = !refresh;
+      radarUpdateStatus();
+      await radarLoadMeta(product, false);
+      radar.loading = false;
+      if (radar.mode !== product) { radarUpdateStatus(); return; }
+      const prev = refresh && radar.product === product ? radar.frames[radar.frameIdx] : null;
+      const atEnd = prev && radar.frameIdx >= radar.frames.length - 1;
+      const frames = radarBuildFrames(product);
+      if (refresh && radar.product === product && frames.length === radar.frames.length &&
+          frames.every((f, k) => f.layer === radar.frames[k].layer)) { radarUpdateStatus(); return; }   // nothing new
+      radar.product = product;
+      radar.frames = frames;
+      document.getElementById('radarSlider').max = frames.length - 1;
+      let idx = product === 'radar' ? frames.length - 1 : 0;
+      if (prev && !(product === 'radar' && atEnd)) {
+        const k = frames.findIndex(f => f.t >= prev.t);
+        idx = k < 0 ? frames.length - 1 : k;
+      }
+      radarGoTo(idx);
+      radarUpdateStatus();
+    }
+
+    function radarStatusText() {
+      const m = radar.meta[radar.mode];
+      if (radar.loading || !m) return 'Loading radar...';
+      const est = m.estimated ? ' (time estimated - IEM not answering)' : '';
+      const fmt = ms => new Date(ms).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+      if (radar.mode === 'radar') return `NEXRAD mosaic via IEM · latest ${fmt(m.t)}${est} · 5-min frames, last hour`;
+      const hh = String(new Date(m.t).getUTCHours()).padStart(2, '0');
+      return `HRRR ${hh}Z run via IEM${est} · ${RADAR.hrrr.stepMin}-min steps, now to +${RADAR.hrrr.aheadMin / 60} h`;
+    }
+
+    function radarUpdateStatus() {
+      const el = document.getElementById('radarStatusMsg');
+      if (el) el.innerText = radarStatusText();
+    }
+
+    function radarFmtFrameTime(ms) {
+      return new Date(ms).toLocaleString('en-US', { timeZone: 'America/New_York', weekday: 'short', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+    }
+
+    function radarSetMode(mode) {
+      if (mode === radar.mode || !radar.map) return;
+      radarPause();
+      radar.mode = mode;
+      document.querySelectorAll('.radar-mode button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+      radarClear();
+      radar.frames = [];
+      radar.product = null;
+      document.getElementById('radarTime').innerText = '-';
+      buildRadarLegend();
+      radarActivate(mode);
+    }
+
+    function radarPause() {
+      if (radar.playTimer) { clearInterval(radar.playTimer); radar.playTimer = null; }
+      const b = document.getElementById('radarPlayBtn');
+      if (b) b.innerText = 'Play';
+    }
+
+    // Radar loops, holding its latest frame for a moment; HRRR plays once to the end.
+    function radarTogglePlay() {
+      if (radar.playTimer) { radarPause(); return; }
+      const n = radar.frames.length;
+      if (!n) return;
+      const loop = radar.mode === 'radar';
+      if (radar.frameIdx >= n - 1) radarGoTo(0);
+      document.getElementById('radarPlayBtn').innerText = 'Pause';
+      const ms = RADAR[radar.mode === 'radar' ? 'nexrad' : 'hrrr'].frameMs;
+      let dwell = 0;
+      radar.playTimer = setInterval(() => {
+        const last = radar.frames.length - 1;
+        if (radar.frameIdx >= last) {
+          if (!loop) { radarPause(); return; }
+          if (dwell++ < RADAR.loopDwell) return;
+          dwell = 0;
+          radarGoTo(0);
+          return;
+        }
+        radarGoTo(radar.frameIdx + 1);
+      }, ms);
+    }
+
+    function radarStep(d) { radarPause(); radarGoTo(radar.frameIdx + d); }
+    function radarFirst() { radarPause(); radarGoTo(0); }
+    function radarLast() { radarPause(); if (radar.frames.length) radarGoTo(radar.frames.length - 1); }
+
+    function buildRadarLegend() {
+      const el = document.getElementById('radarLegend');
+      if (!el) return;
+      const sw = RADAR.dbzColors.filter((_, k) => k % 2 === 0)
+        .map(([t, c]) => `<span class="sw"><i style="background:${c}"></i>${t}</span>`).join('');
+      const what = radar.mode === 'radar' ? 'NEXRAD base reflectivity' : 'HRRR simulated reflectivity (model, not observed)';
+      el.innerHTML = `<span><b>dBZ:</b></span>${sw}<span class="note">${what} · ~20 light, 40 moderate, 50+ heavy</span>`;
+    }
+
+    // Keeps the radar's frames current while it's showing (new radar frames, new HRRR runs).
+    function radarStartRefresh() {
+      if (radar.refreshTimer) return;
+      radar.refreshTimer = setInterval(() => {
+        if (radar.loading || document.hidden) return;
+        radarActivate(radar.mode, true);
+      }, 60000);
+    }
+
+    /* =====================================================================
        INIT
        ===================================================================== */
+    radar.map = radarInitMap(SNOTEL_SITES.find(s => s.id === DEFAULT_SITE_ID));
+    buildRadarLegend();
+    if (radar.map) { radarActivate('radar'); radarStartRefresh(); }
     setDefaultEndDate();
     loadSite();
   </script>
